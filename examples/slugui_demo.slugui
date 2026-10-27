@@ -1,0 +1,192 @@
+component SlugUiDemoGenerated {
+  property int clicks = 0;
+  property string counter_label = "Immediate clicks: 0";
+  property bool popup_visible = false;
+
+  Absolute root {
+    Rectangle content {
+      layout: column;
+      width: 100%;
+      height: 100%;
+      padding: 22px;
+      spacing: 12px;
+      fill: #11182b;
+      radius: 14;
+      smoothing: 100%;
+
+      Text title {
+        height: 38px;
+        text: "SlugUI declarative AOT";
+        font-size: 25;
+        bold: true;
+        fill: linear(#71e8ff, #b68cff);
+      }
+
+      Text description {
+        height: 54px;
+        text: "Compiled .slugui + typed properties lower directly into one DrawList.\nThe same IR is the target of the Figma selection exporter.";
+        font-size: 14;
+        fill: #aab7d8;
+      }
+
+      Row features {
+        grow: 1;
+        spacing: 12px;
+
+        Rectangle layout_card {
+          grow: 1;
+          fill: #253b66;
+          stroke: linear(#62dcff, #9274ff);
+          stroke-width: 2;
+          stroke-align: inside;
+          radius: 12;
+          smoothing: 70%;
+          source-provider: "figma";
+          source-document: "SlugUI-example";
+          source-node: "12:4";
+          source-name: "Responsive layout";
+          fidelity: native;
+
+          Shape svg_vector_probe {
+            x: 12px;
+            y: 12px;
+            width: 24px;
+            height: 24px;
+            path-data: "M 2 2 L 22 2 L 12 22 Z";
+            fill: linear(#62dcff, #9274ff);
+            stroke-path-data: "M 1 1 L 23 1 L 12 23 Z M 12 20 L 20 3 L 4 3 Z";
+            stroke: #ffffff;
+            stroke-width: 2;
+            stroke-align: center;
+            fidelity: baked-vector;
+          }
+
+          Text label {
+            text: "Responsive layout";
+            font-size: 17;
+            bold: true;
+            text-align: center;
+            fill: #e9efff;
+          }
+        }
+
+        Rectangle state_card {
+          grow: 1;
+          fill: #2b4660;
+          radius: 12;
+          smoothing: 70%;
+          source-provider: "figma";
+          source-document: "SlugUI-example";
+          source-node: "12:5";
+          source-name: "Typed reactive state";
+          fidelity: native;
+
+          Text label {
+            text: "Typed reactive state";
+            font-size: 17;
+            bold: true;
+            text-align: center;
+            fill: #e9efff;
+          }
+        }
+
+        Rectangle figma_card {
+          grow: 1;
+          fill: #443461;
+          radius: 12;
+          smoothing: 70%;
+          source-provider: "figma";
+          source-document: "SlugUI-example";
+          source-node: "12:6";
+          source-name: "Figma source metadata";
+          fidelity: native;
+
+          Text label {
+            text: "Figma source metadata";
+            font-size: 17;
+            bold: true;
+            text-align: center;
+            fill: #e9efff;
+          }
+        }
+      }
+
+      Row controls {
+        height: 52px;
+        spacing: 12px;
+
+        Rectangle counter_button {
+          grow: 1;
+          fill: #35446c;
+          fill-hovered: #4865a0;
+          fill-pressed: #6c55c7;
+          radius: 10;
+          smoothing: 100%;
+          callback: increment;
+
+          Text label {
+            text: $counter_label;
+            font-size: 15;
+            bold: true;
+            text-align: center;
+            fill: #e9efff;
+          }
+        }
+
+        Rectangle popup_button {
+          grow: 1;
+          fill: #35446c;
+          fill-hovered: #4865a0;
+          fill-pressed: #6c55c7;
+          radius: 10;
+          smoothing: 100%;
+          callback: toggle_popup;
+
+          Text label {
+            text: "Toggle overlay";
+            font-size: 15;
+            bold: true;
+            text-align: center;
+            fill: #e9efff;
+          }
+        }
+      }
+
+      Text note {
+        height: 24px;
+        text: "No runtime parser or per-frame property-name lookup. State can relayout in the input frame.";
+        font-size: 12;
+        fill: #9aa9cf;
+      }
+    }
+
+    Rectangle popup {
+      layout: column;
+      x: 82px;
+      y: 180px;
+      width: 440px;
+      height: 150px;
+      padding: 18px;
+      spacing: 10px;
+      fill: #27375c;
+      radius: 14;
+      smoothing: 100%;
+      visible: $popup_visible;
+      overlay: true;
+
+      Text title {
+        height: 32px;
+        text: "Overlay stays above normal UI";
+        font-size: 19;
+        fill: #e9efff;
+      }
+
+      Text detail {
+        grow: 1;
+        text: "Overlay propagates through descendants and lowers into DrawList's overlay batch.";
+        font-size: 14;
+        fill: #aab7d8;
+      }
+    }
+  }
+}

@@ -1,0 +1,242 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root { font: 12px/1.45 Inter, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      color: var(--figma-color-text);
+      background: var(--figma-color-bg);
+    }
+    header { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+    h1 { margin: 0; font-size: 16px; }
+    .muted { color: var(--figma-color-text-secondary); }
+    .summary { display: flex; gap: 6px; flex-wrap: wrap; margin: 12px 0; }
+    .badge {
+      padding: 3px 7px;
+      border-radius: 999px;
+      color: var(--figma-color-text-secondary);
+      background: var(--figma-color-bg-secondary);
+    }
+    .actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+    button {
+      min-height: 32px;
+      padding: 6px 10px;
+      border: 1px solid var(--figma-color-border);
+      border-radius: 6px;
+      color: var(--figma-color-text);
+      background: var(--figma-color-bg-secondary);
+      cursor: pointer;
+    }
+    button.primary {
+      color: var(--figma-color-text-onbrand);
+      border-color: var(--figma-color-bg-brand);
+      background: var(--figma-color-bg-brand);
+    }
+    button:disabled { opacity: .45; cursor: default; }
+    textarea {
+      width: 100%;
+      height: 330px;
+      resize: vertical;
+      padding: 10px;
+      border: 1px solid var(--figma-color-border);
+      border-radius: 6px;
+      color: var(--figma-color-text);
+      background: var(--figma-color-bg-secondary);
+      font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+      tab-size: 2;
+    }
+    h2 { margin: 13px 0 7px; font-size: 12px; }
+    #diagnostics {
+      max-height: 145px;
+      overflow: auto;
+      border-top: 1px solid var(--figma-color-border);
+    }
+    .diagnostic { padding: 7px 0; border-bottom: 1px solid var(--figma-color-border); }
+    .diagnostic strong { margin-right: 6px; }
+    .native { color: var(--figma-color-text-success); }
+    .baked { color: var(--figma-color-text-brand); }
+    .approximated { color: var(--figma-color-text-warning); }
+    .unsupported { color: var(--figma-color-text-danger); }
+    #status { min-height: 18px; margin-top: 7px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>SlugUI Exporter</h1>
+      <div class="muted">Selection → typed .slugui → AOT C++</div>
+    </div>
+    <button id="close" aria-label="Close">Close</button>
+  </header>
+
+  <div class="summary">
+    <span class="badge" id="selection">0 selected</span>
+    <span class="badge native" id="native">0 native</span>
+    <span class="badge baked" id="baked-vector">0 baked vector</span>
+    <span class="badge approximated" id="approximated">0 approximated</span>
+    <span class="badge unsupported" id="unsupported">0 unsupported</span>
+  </div>
+
+  <div class="actions">
+    <button id="refresh">Refresh</button>
+    <button id="copy">Copy</button>
+    <button class="primary" id="download">Download .slugui</button>
+  </div>
+
+  <textarea id="source" readonly spellcheck="false"
+    placeholder="Select a Frame, Component, or node in Figma."></textarea>
+  <div id="status" class="muted"></div>
+  <h2>Fidelity diagnostics</h2>
+  <div id="diagnostics"></div>
+
+  <script>
+    const state = { source: "", sourceAvailable: false, filename: "", diagnostics: [] };
+    const SOURCE_PREVIEW_LIMIT = 200000;
+    const DIAGNOSTIC_RENDER_LIMIT = 250;
+    const source = document.getElementById("source");
+    const status = document.getElementById("status");
+    const download = document.getElementById("download");
+    const copy = document.getElementById("copy");
+
+    function sourcePreview(value) {
+      if (value.length <= SOURCE_PREVIEW_LIMIT) return value;
+      return value.slice(0, SOURCE_PREVIEW_LIMIT) +
+        "\n\n// … preview truncated; Copy/Download still use the complete .slugui";
+    }
+
+    function send(type) {
+      parent.postMessage({ pluginMessage: { type } }, "*");
+    }
+
+    function requestSource(action) {
+      parent.postMessage({ pluginMessage: { type: "request-source", action } }, "*");
+    }
+
+    function renderDiagnostics(items) {
+      const container = document.getElementById("diagnostics");
+      container.replaceChildren();
+      if (!items.length) {
+        const empty = document.createElement("div");
+        empty.className = "diagnostic native";
+        empty.textContent = "No fidelity warnings.";
+        container.appendChild(empty);
+        return;
+      }
+      const count = Math.min(items.length, DIAGNOSTIC_RENDER_LIMIT);
+      for (let index = 0; index < count; ++index) {
+        const item = items[index];
+        const row = document.createElement("div");
+        row.className = "diagnostic " + String(item.fidelity || "").toLowerCase();
+        const code = document.createElement("strong");
+        code.textContent = item.code;
+        const location = item.nodeName ? " [" + item.nodeName + " / " + item.nodeId + "] " : " ";
+        row.append(code, document.createTextNode(location + item.message));
+        container.appendChild(row);
+      }
+      if (items.length > count) {
+        const more = document.createElement("div");
+        more.className = "diagnostic muted";
+        more.textContent = String(items.length - count) + " additional diagnostics hidden from preview.";
+        container.appendChild(more);
+      }
+    }
+
+    window.onmessage = (event) => {
+      const message = event.data.pluginMessage;
+      if (!message) return;
+      if (message.type === "source-payload") {
+        const fullSource = message.source || "";
+        state.source = fullSource;
+        if (message.action === "download") {
+          downloadSource(fullSource, message.filename || state.filename);
+        } else {
+          copySource(fullSource);
+        }
+        return;
+      }
+      if (message.type !== "export-result") return;
+      state.source = message.source || "";
+      state.sourceAvailable = Boolean(message.sourceAvailable || state.source);
+      state.filename = message.filename || "";
+      state.diagnostics = message.diagnostics || [];
+      const preview = sourcePreview(message.sourcePreview || state.source);
+      if (source.value !== preview) source.value = preview;
+      download.disabled = copy.disabled = !state.sourceAvailable;
+      document.getElementById("selection").textContent =
+        String(message.selectionCount || 0) + " selected";
+      const counts = message.fidelityCounts ||
+        { native: 0, approximated: 0, bakedVector: 0, unsupported: 0 };
+      document.getElementById("native").textContent = counts.native + " native";
+      document.getElementById("baked-vector").textContent =
+        (counts.bakedVector || 0) + " baked vector";
+      document.getElementById("approximated").textContent = counts.approximated + " approximated";
+      document.getElementById("unsupported").textContent = counts.unsupported + " unsupported";
+      const stats = message.stats || {};
+      const timing = typeof stats.generationMs === "number"
+        ? " · " + stats.generationMs + " ms"
+        : "";
+      const nodes = typeof stats.nodeCount === "number"
+        ? " · " + stats.nodeCount + " nodes"
+        : "";
+      const cacheHits = (stats.vectorCacheHits || 0) + (stats.textCacheHits || 0);
+      const cache = cacheHits > 0 ? " · " + cacheHits + " cached" : "";
+      status.textContent = state.sourceAvailable
+        ? state.filename + " is ready (format v" + message.formatVersion + ")" +
+          nodes + timing + cache + "."
+        : "Nothing exportable is selected.";
+      renderDiagnostics(state.diagnostics);
+    };
+
+    async function copySource(value) {
+      if (!value) return;
+      try {
+        await navigator.clipboard.writeText(value);
+        status.textContent = "Copied " + state.filename + ".";
+      } catch (_) {
+        const preview = source.value;
+        source.value = value;
+        source.focus();
+        source.select();
+        document.execCommand("copy");
+        source.value = preview;
+        status.textContent = "Copied " + state.filename + ".";
+      }
+    }
+
+    function downloadSource(value, filename) {
+      if (!value) return;
+      const blob = new Blob([value], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename || "FigmaSelection.slugui";
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      status.textContent = "Downloaded " + anchor.download + ".";
+    }
+
+    document.getElementById("refresh").onclick = () => send("refresh");
+    document.getElementById("close").onclick = () => send("close");
+    copy.onclick = () => {
+      if (!state.sourceAvailable) return;
+      if (state.source) copySource(state.source);
+      else requestSource("copy");
+    };
+    download.onclick = () => {
+      if (!state.sourceAvailable) return;
+      if (state.source) downloadSource(state.source, state.filename);
+      else requestSource("download");
+    };
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") send("close");
+    });
+    download.disabled = copy.disabled = true;
+    send("refresh");
+  </script>
+</body>
+</html>

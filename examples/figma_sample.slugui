@@ -1,0 +1,12 @@
+component FigmaSampleGenerated {
+  Absolute root {
+    width: 236px;
+    height: 339px;
+    Rectangle panel {
+      width: 100%; height: 100%; fill: #11182b; radius: 16;
+      Text title { x: 18px; y: 20px; width: 200px; height: 36px; text: "slugia"; font-size: 26; fill: #ffffff; }
+      Text detail { x: 18px; y: 68px; width: 200px; height: 64px; text: "Vector UI sample"; font-size: 16; fill: #aab7d8; }
+      Rectangle card { x: 18px; y: 154px; width: 200px; height: 100px; fill: linear(#62dcff, #9274ff); radius: 12; }
+    }
+  }
+}
