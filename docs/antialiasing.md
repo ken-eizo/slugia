@@ -1,5 +1,16 @@
 # Anti-aliasing / alpha-group fidelity (2026-11-22)
 
+## Canonical build folder (2026-11-22)
+
+All new Slugia builds must use `D:\Developer\slugia\build`, not a sibling of the repository.
+The superseded sibling build folders were consolidated. Historical GPU captures,
+benchmark JSON, logs and pre-fix reference binaries are retained in
+`D:\Developer\slugia\build\research` with source-prefixed filenames.
+`research\merge_manifest_20261122.json` records source paths and SHA-256 hashes.
+Historical records mentioning retired build-folder names refer to that archived
+evidence; do not recreate those directories. GUI distributables remain in `dist\bin`.
+
+
 ## OPEN — P0 rendering-quality defect (not resolved)
 
 **Status as of 2026-11-22: UNRESOLVED.** The user still sees visible
@@ -77,7 +88,7 @@ Do not choose implementation complexity/extra GPU sampling on visual intuition a
 - **Exact rectangular-mask intersection:** the Vulkan clip-table builder intersects axis-aligned zero-radius rectangles if and only if they share identical `inverseWorld` and `projectiveLocal` coordinates. It emits one Slug mask for their geometric intersection instead of `min(maskA,maskB)`, which is mathematically wrong at perpendicular fractional-pixel crossings. Empty intersections remain on the previous path rather than making invalid zero-sized paths. Nonrectangular/independently transformed masks are not altered.
 - **Zero-allocation common path:** a single-mask chain uses its existing vector; multi-mask chains alone allocate a temporary vector for compaction.
 - **New GPU regression:** `tests/figma_import_gpu_test.cpp` compares two intersecting fractional rectangular masks against their analytically identical intersection rectangle, including edges and a subpixel corner. It is not tied to the ColorPicker.
-- **GPU ColorPicker reference confirmation:** current ColorPicker v5 captured via the RTX 2070 SUPER Release GPU test after the first two changes is exactly identical in RGB across the full 787×434 native capture to the pre-patch `slugia-lowpower-build` GPU test (0 differing channel samples). Against the independent 16× checker reference: max 4.7793/255, mean 0.28207/255, and 0 channel samples above 5. The comparison is reproducible with `D:\Developer\slugia-aa-review-20261122-build\compare_aa.py` and `before.ppm`/`after.ppm` there.
+- **GPU ColorPicker reference confirmation:** current ColorPicker v5 captured via the RTX 2070 SUPER Release GPU test after the first two changes is exactly identical in RGB across the full 787×434 native capture to the pre-patch `slugia-lowpower-build` GPU test (0 differing channel samples). Against the independent 16× checker reference: max 4.7793/255, mean 0.28207/255, and 0 channel samples above 5. The comparison is reproducible with `D:\Developer\slugia\build\research\aa-review__compare_aa.py` and the source-prefixed `aa-review__before.ppm`/`aa-review__after.ppm` there.
 
 General isolated compositing of arbitrarily clipped nested translucent child groups is still *not* implemented. This optimization has a well-defined rectangular-coincident coordinate-space scope; arbitrary curve intersections will require separate rigorous area-integration tests. Performance impact must be measured on identical workloads before claiming net throughput or power improvement.
 
@@ -93,9 +104,9 @@ The exact ColorPicker capture is unchanged at the native pixel level and the int
 
 ## Final local verification and staging (2026-11-22)
 
-- Release build: `D:\Developer\slugia-aa-review-20261122-build\Release`, Visual Studio 2022, Windows x64 / Vulkan SDK; MSBuild exit 0.
-- Entire final CTest suite: **56/56 PASSED**, zero failed, `D:\Developer\slugia-aa-review-20261122-build\ctest-final.log` (GPU, SVG, ColorPicker, 3D, compiler, idle smoke).
-- ColorPicker final GPU capture: `D:\Developer\slugia-aa-review-20261122-build\after.ppm`; checker reference max **4.7793/255**, mean **0.28207/255**, all 787×434 native RGB capture pixels identical to old pre-patch build. `compare_aa.py` and generated `after.png`/`change_heatmap.png` live in that build directory.
+- Release build: `D:\Developer\slugia\build\Release`, Visual Studio 2022, Windows x64 / Vulkan SDK; MSBuild exit 0.
+- Entire final CTest suite: **56/56 PASSED**, zero failed, `D:\Developer\slugia\build\research\aa-review__ctest-final.log` (GPU, SVG, ColorPicker, 3D, compiler, idle smoke).
+- ColorPicker final GPU capture: `D:\Developer\slugia\build\research\aa-review__after.ppm`; checker reference max **4.7793/255**, mean **0.28207/255**, all 787×434 native RGB capture pixels identical to old pre-patch build. The archived script and generated `aa-review__after.png`/`aa-review__change_heatmap.png` live in `build/research`.
 - Staged an explicitly **non-overwriting**, SHA-addressed EXE: `D:\Developer\slugia\dist\bin\slugia-aa-reviewed-20261122-e96ae27d1287.exe`. The staged file passed both `--smoke` and `--idle-smoke`. Idle smoke confirmed **5 waits, 0 additional submissions, 0 draw-list rebuilds**.
 - **Performance warning remains:** the revised static SVG GPU benchmark is slower on RTX 2070 SUPER (old ~2.12–2.39 ms p95 versus revised ~2.58–3.76 ms across repeats). Do not replace the previous efficient executable or advertise a GPU speedup from this change. Power, general-group isolation and full-document Figma PNG parity are still unverified.
 - The worktree's pre-existing uncommitted changes were preserved. No GitHub push was performed.
@@ -131,7 +142,7 @@ The automated GPU regression includes zoom/pan checker center-point comparisons 
 ### Reproduce seven zoom captures (PowerShell, using an out-of-tree Release build)
 
 ```powershell
-$build = 'D:\Developer\slugia-aa-review-20261122-build'
+$build = 'D:\Developer\slugia\build'
 $exe = Join-Path $build 'Release\slugia_figma_import_gpu_tests.exe'
 foreach ($z in @('0.5','0.75','0.9','1.0','1.125','1.5','2.0')) {
   & $exe --capture-zoom $z (Join-Path $build "zoom_$z.ppm")
@@ -146,7 +157,7 @@ The baseline captures are saved as `zoom_before_*.ppm` in the same build folder 
 ### Final validation — zoom-coordinate fix
 
 - Release build completed successfully using VS2022 x64/Vulkan.
-- Final full CTest: **56/56 PASS**, 0 failed; see `D:\Developer\slugia-aa-review-20261122-build\ctest-zoom-fix.log`. Tests include all preexisting GPU/quality checks and the newly added seven-zoom/checker + 90-degree projected mask assertions.
+- Final full CTest: **56/56 PASS**, 0 failed; see `D:\Developer\slugia\build\research\aa-review__ctest-zoom-fix.log`. Tests include all preexisting GPU/quality checks and the newly added seven-zoom/checker + 90-degree projected mask assertions.
 - The full native untransformed ColorPicker GPU capture (`zoomfix_native.ppm`) was compared against the saved pre-fix `before.ppm` at 787×434 and has **0 changed RGB channel samples**. The new correction only changes transformed masked-paint evaluation.
 - The 16× independent zoom reference validator succeeded for all seven cases with maximum error at most **5.476/255**, vs pre-fix maxima up to 39.724/255. The seven zoomed GPU captures, before captures and JSON reports are kept in the separate build directory.
 - The GUI smoke test and zero-idle-submit smoke test succeeded with **5 empty waits and no extra GPU frames or draw-list rebuilds**.

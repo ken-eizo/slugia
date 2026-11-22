@@ -19,7 +19,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
-Windows 10 / Visual Studio 2022では以下の一括ビルドを推奨します。現在起動中のEXEと干渉しない独立した出力ディレクトリに、Vulkan shader・静的ライブラリ・デモEXE・Figma開発プラグイン・SlugUI AOTコンパイラをまとめて検証・配置します。
+Windows 10 / Visual Studio 2022では以下の一括ビルドを推奨します。**ビルドディレクトリは常に `D:\Developer\slugia\build`（リポジトリ内 `build/`）の1か所**を使います。GPUテスト・Vulkan shader・静的ライブラリ・EXEはここにまとめ、実行向け配布物は `dist/` に配置します。別名の `D:\Developer\slugia-*-build` フォルダは作成しません。実行中のEXEは強制終了しません。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_windows_release.ps1

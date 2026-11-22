@@ -1,5 +1,5 @@
-# Reproducible, out-of-tree Windows Release build of the Slugia runtime,
-# Figma development plugin, AOT compiler and Vulkan demo EXE.
+# Reproducible Windows Release build in the single canonical project build directory.
+# Includes the Figma development plugin, AOT compiler and Vulkan demo EXE.
 param(
   [string]$BuildDirectory = "",
   [string]$OutputDirectory = "",
@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if (-not $BuildDirectory) {
-  $BuildDirectory = Join-Path (Split-Path $root -Parent) "slugia-verified-build"
+  $BuildDirectory = Join-Path $root "build"
 }
 if (-not $OutputDirectory) {
   $OutputDirectory = Join-Path $root "dist"
@@ -30,14 +30,23 @@ function Invoke-Checked {
     throw "$Executable failed with exit code $LASTEXITCODE."
   }
 }
-Invoke-Checked cmake @(
-  "-S", $root, "-B", $BuildDirectory, "-G", "Visual Studio 17 2022", "-A", "x64",
+# Reuse the canonical CMake generator configuration as-is. Existing build/
+# directories may have the implicit VS2022 x64 platform, and passing -A x64
+# after initial configure would make CMake reject the cache. Only new caches
+# need an explicit platform selection.
+$configureArgs = @("-S", $root, "-B", $BuildDirectory,
+                   "-G", "Visual Studio 17 2022")
+if (-not (Test-Path (Join-Path $BuildDirectory "CMakeCache.txt"))) {
+  $configureArgs += @("-A", "x64")
+}
+$configureArgs += @(
   "-DSLUGIA_ENABLE_3D=ON", "-DSLUGIA_BUILD_TESTS=ON", "-DSLUGIA_BUILD_GPU_TESTS=ON",
   "-DSLUGIA_INSTALL=ON",
   "-DVulkan_INCLUDE_DIR=$VulkanSdk/Include",
   "-DVulkan_LIBRARY=$VulkanSdk/Lib/vulkan-1.lib",
   "-DVulkan_GLSLC_EXECUTABLE=$VulkanSdk/Bin/glslc.exe"
 )
+Invoke-Checked cmake $configureArgs
 Invoke-Checked cmake @("--build", $BuildDirectory, "--config", "Release", "--parallel", "8")
 if ($FullTests) {
   Invoke-Checked ctest @("--test-dir", $BuildDirectory, "-C", "Release",

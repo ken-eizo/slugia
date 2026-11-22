@@ -254,7 +254,7 @@ Figma純正PNGとの全ピクセルの一致は未検証です。非Normalブレ
 
 ## v5以降のFigmaインポート・EXE更新の整合性（2026-11-22）
 
-従来は `dist/bin/slugia-example.exe` のように**ビルド先からコピーしたEXE**を起動してFigmaファイルをdropすると、別の`slugia-verified-build/Release/slugia-example.exe`が再コンパイルされても、**最初のコピーを再び起動**していました。その旧EXEに`--import-success`を付けていたため、「Drop import succeeded」と出てもグラデーションは旧表示のままでした。
+従来は `dist/bin/slugia-example.exe` のように**ビルド先からコピーしたEXE**を起動してFigmaファイルをdropすると、別のビルド先の`Release/slugia-example.exe`が再コンパイルされても、**最初のコピーを再び起動**していました。その旧EXEに`--import-success`を付けていたため、「Drop import succeeded」と出てもグラデーションは旧表示のままでした。
 
 現在は`tools/rebuild_example.cmake`が`BUILD_DIR`の実際にビルドされたEXEを検証・再起動します。さらにSlugUI AOTコンパイラは入力の正規化UTF-8 FNV-1a指紋を生成C++内へ埋め込み、Figmaプレビューの起動時にディスク上の`.slugui`と照合します。異なる場合、旧バイナリが**「成功」表示で古い形を出すことを禁止**し、`STALE COMPILED FIGMA DATA`を表示します。
 
@@ -266,7 +266,7 @@ Figma純正PNGとの全ピクセルの一致は未検証です。非Normalブレ
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_windows_release.ps1
-& 'D:\Developer\slugia-verified-build\Release\slugia-example.exe' --figma --import-success
+& 'D:\Developer\slugia\build\Release\slugia-example.exe' --figma --import-success
 ```
 
 `dist/bin`からインポートしても、以後の自動再起動先は**検証済みのビルドディレクトリ**です。旧EXEの強制終了や、別名EXEへの黙った差し替えは不要です。
