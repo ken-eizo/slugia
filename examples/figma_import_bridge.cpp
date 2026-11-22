@@ -2,8 +2,13 @@
 #include "figma_sample.generated.hpp"
 
 #include <utility>
+#include <cstdint>
 
 namespace slugia::example {
+
+std::uint64_t compiledFigmaSourceFingerprint() {
+  return FigmaSampleGenerated::sluguiSourceFingerprint;
+}
 
 std::optional<slugui::Component> buildFigmaImport(VectorAtlas& atlas, bool enabled) {
   if (!enabled) return std::nullopt;

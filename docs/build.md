@@ -19,6 +19,14 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
+Windows 10 / Visual Studio 2022では以下の一括ビルドを推奨します。現在起動中のEXEと干渉しない独立した出力ディレクトリに、Vulkan shader・静的ライブラリ・デモEXE・Figma開発プラグイン・SlugUI AOTコンパイラをまとめて検証・配置します。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_windows_release.ps1
+```
+
+必要に応じて `-BuildDirectory`、`-OutputDirectory`、`-VulkanSdk`を指定できます。`-FullTests`を追加するとGPU画質テストを含む全CTestを走らせます。既定の出力は`dist/bin/slugia-example.exe`、`dist/bin/slugui-compiler.cmd`、`dist/share/slugia/figma-slugui-v6/manifest.json`（Figma開発プラグイン「SlugUI Exporter - Stroke v6」）です。ベクター・3DのデモEXEも同じ`dist/bin`に配置します。FigmaプラグインはJavaScript/HTMLで動く開発プラグインで、EXEへ変換するものではありません。
+
 SDKを自動検出できない場合は `VULKAN_SDK`、または `-DVulkan_ROOT=/path/to/sdk` を指定します。
 WindowsではVisual StudioのC++ desktop workloadを使用します。macOSではSDKの設定scriptを読み込んでから実行します。
 Vulkan portability enumeration / subsetは対応deviceで自動的に有効にします。

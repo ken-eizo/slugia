@@ -236,7 +236,7 @@ assert.strictEqual(exported.component, "Settings_PanelGenerated");
 assert.match(exported.source, /component Settings_PanelGenerated/);
 assert.match(exported.source, /layout: column;/);
 assert.match(exported.source, /padding: \[24px, 20px, 24px, 20px\];/);
-assert.match(exported.source, /linear\(#3380ff, #b34dff\)/);
+assert.match(exported.source, /linear\(#3380ff, #b34dff, 0, 0, 1, 0\)/);
 assert.match(exported.source, /radius: \[4, 8, 12, 16\];/);
 assert.match(exported.source, /stroke: #1ae6b3;/);
 assert.match(exported.source, /stroke-width: 2.5;/);
@@ -253,9 +253,36 @@ assert.strictEqual(flattenCalls, 0, "exporting must not reparent vector geometry
 assert.match(exported.source, /fidelity: baked-vector;/);
 assert.strictEqual(exported.fidelityCounts.bakedVector, 2);
 assert.strictEqual(exported.fidelityCounts.unsupported, 0);
-assert.ok(exported.fidelityCounts.approximated >= 1);
+assert.ok(exported.fidelityCounts.native >= 2,
+  "two-stop Figma linear gradients should preserve native fidelity");
+assert.ok(exported.diagnostics.some((item) => item.code === "W_ROUNDED_CLIP_SMOOTHING"),
+  "Figma nonzero corner smoothing must be flagged as approximate");
 assert.ok(!exported.diagnostics.some((item) => item.code === "E_VECTOR_GEOMETRY_MISSING"));
-assert.ok(exported.diagnostics.some((item) => item.code === "W_GRADIENT_TRANSFORM"));
+assert.ok(!exported.diagnostics.some((item) => item.code === "W_GRADIENT_TRANSFORM"),
+  "invertible Figma linear gradient transforms must not be discarded");
+
+// A vertical linear gradient must preserve its actual scalar gradient axis
+// and stop offsets, even when Figma's second transform row places the visual
+// handles on a parallel offset line. The rendered pixels depend on t=y.
+const gradientWithStops = base({
+  type: "RECTANGLE", id: "12:gradient", name: "Vertical Stops",
+  width: 80, height: 150,
+  fills: [{
+    type: "GRADIENT_LINEAR", visible: true, opacity: 1,
+    gradientTransform: [[0, 1, 0], [-1, 0, 1]],
+    gradientStops: [
+      { position: 0.2, color: { r: 1, g: 0, b: 0, a: 1 } },
+      { position: 0.8, color: { r: 0, g: 0, b: 1, a: 1 } },
+    ],
+  }],
+});
+figma.currentPage.selection = [gradientWithStops];
+figma.ui.onmessage({ type: "refresh" });
+const verticalGradient = messages[messages.length - 1];
+assert.match(verticalGradient.source, /linear\(#ff0000, #0000ff, 0, 0\.2, 0, 0\.8\)/);
+assert.ok(!verticalGradient.diagnostics.some((item) => item.code === "W_GRADIENT_TRANSFORM"));
+figma.currentPage.selection = selection;
+figma.ui.onmessage({ type: "refresh" });
 assert.ok(!exported.diagnostics.some((item) => item.code === "W_VECTOR_STROKE_ALIGN"));
 assert.ok(!exported.diagnostics.some((item) => item.code === "E_VECTOR_STROKE_OUTLINE"));
 assert.ok(pageListeners.nodechange, "current-page node edits should trigger an incremental export refresh");

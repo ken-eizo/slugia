@@ -103,7 +103,7 @@ public:
   }
 
   void requestRedraw() noexcept override {
-    glfwPostEmptyEvent();
+    window_.postRedrawEvent();
   }
 
   void waitForVisibleFramebuffer() override {
@@ -139,12 +139,25 @@ float srgbToLinear(float value) {
 }
 
 bool paintFullyOpaque(const Paint& paint) {
-  return paint.opacity * std::min(paint.start.a, paint.end.a) >= 1.0f - paintAlphaEpsilon;
+  if (paint.opacity < 1.0f - paintAlphaEpsilon) return false;
+  if (paint.stops) {
+    return std::all_of(paint.stops->begin(), paint.stops->end(),
+                       [](const GradientStop& stop) {
+                         return stop.color.a >= 1.0f - paintAlphaEpsilon;
+                       });
+  }
+  return std::min(paint.start.a, paint.end.a) >= 1.0f - paintAlphaEpsilon;
 }
 
 bool paintFullyTransparent(const Paint& paint) {
-  return paint.opacity <= paintAlphaEpsilon ||
-    std::max(paint.start.a, paint.end.a) <= paintAlphaEpsilon;
+  if (paint.opacity <= paintAlphaEpsilon) return true;
+  if (paint.stops) {
+    return std::all_of(paint.stops->begin(), paint.stops->end(),
+                       [](const GradientStop& stop) {
+                         return stop.color.a <= paintAlphaEpsilon;
+                       });
+  }
+  return std::max(paint.start.a, paint.end.a) <= paintAlphaEpsilon;
 }
 
 BorderWidths resolvedBorderWidths(const BorderStyle& border) {
@@ -373,6 +386,7 @@ struct Instance {
   float gradient[4];
   float clip[4];
   float strokeWidths[4];
+  std::uint32_t roundedClipRef = 0;
 };
 constexpr VkDeviceSize retainedUploadStagingLimit = 4U << 20U;
 struct RetainedUploadRange {
@@ -510,6 +524,19 @@ struct VulkanRenderer::Impl {
   std::unordered_map<std::uint64_t,std::array<std::uint32_t,4>> atlasStorageShapes;
   std::uint32_t atlasRefinedShapeCount = 0;
   std::uint32_t atlasPackedBandShapeCount = 0;
+  // Temporary per-IR handles for immutable gradient tables. Stop data is packed
+  // after the Slug band headers in the SAME binding-4 buffer (no extra descriptor).
+  mutable std::vector<RoundedClipChain> roundedClipHandles{};
+  mutable std::unordered_map<const std::vector<RoundedClip>*, std::uint32_t>
+      roundedClipHandleByAddress{};
+  struct GradientTable {
+    std::shared_ptr<const std::vector<GradientStop>> stops;
+    GradientKind kind{GradientKind::LinearStops};
+    std::array<float,6> transform{1,0,0,0,1,0};
+  };
+  mutable std::vector<GradientTable> gradientHandles{};
+  mutable std::unordered_map<const std::vector<GradientStop>*, std::uint32_t>
+      gradientHandleByAddress{};
   std::array<std::uint32_t, 7> atlasRefinedShapesByCells{};
   std::size_t atlasStorageCurveBytes = 0,atlasStorageBandBytes = 0;
   std::size_t retainedUploadStagingPeakBytes = 0;
@@ -1251,6 +1278,20 @@ struct VulkanRenderer::Impl {
   }
 
   VkSurfaceFormatKHR chooseFormat(const std::vector<VkSurfaceFormatKHR>& formats) const {
+    if (config.preferSrgbAlphaCompositing) {
+      // UNORM with SRGB_NONLINEAR presentation: write encoded sRGB samples
+      // and blend source-over in that same space. This matches Figma's
+      // transparent paint stacking and avoids the bright, milky black ramps
+      // produced by linear-light alpha compositing on *_SRGB attachments.
+      for (const auto& format : formats)
+        if (format.format == VK_FORMAT_B8G8R8A8_UNORM &&
+            format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+          return format;
+      for (const auto& format : formats)
+        if (format.format == VK_FORMAT_R8G8B8A8_UNORM &&
+            format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+          return format;
+    }
     for (const auto& format : formats)
       if (format.format == VK_FORMAT_B8G8R8A8_SRGB &&
           format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
@@ -1362,7 +1403,7 @@ struct VulkanRenderer::Impl {
     const std::array stages{vertexStage, fragmentStage};
 
     VkVertexInputBindingDescription binding{0, sizeof(Instance), VK_VERTEX_INPUT_RATE_INSTANCE};
-    std::array<VkVertexInputAttributeDescription, 10> attributes{{
+    std::array<VkVertexInputAttributeDescription, 11> attributes{{
       {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, positionRect)},
       {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, emRect)},
       {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, bandTransform)},
@@ -1372,7 +1413,8 @@ struct VulkanRenderer::Impl {
       {6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, paint)},
       {7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, gradient)},
       {8, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, clip)},
-      {9, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, strokeWidths)}
+      {9, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Instance, strokeWidths)},
+      {10, 0, VK_FORMAT_R32_UINT, offsetof(Instance, roundedClipRef)}
     }};
     VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vertexInput.vertexBindingDescriptionCount = 1;
@@ -1694,6 +1736,231 @@ struct VulkanRenderer::Impl {
     }
   }
 
+  void registerRoundedClips(Instance& quad, const RoundedClipChain& masks) const {
+    if (!masks || masks->empty()) return;
+    if (masks->size() > 64)
+      throw std::length_error("Rounded clip depth exceeds 64 masks");
+    const auto found = roundedClipHandleByAddress.find(masks.get());
+    std::uint32_t index{};
+    if (found != roundedClipHandleByAddress.end()) {
+      index = found->second;
+    } else {
+      index = static_cast<std::uint32_t>(roundedClipHandles.size());
+      if (index == std::numeric_limits<std::uint32_t>::max())
+        throw std::length_error("Too many distinct rounded clip chains");
+      roundedClipHandles.push_back(masks);
+      roundedClipHandleByAddress.emplace(masks.get(), index);
+    }
+    quad.roundedClipRef = (index + 1u) | 0x80000000u;
+  }
+
+  void finishRoundedClipTables(RenderIR& ir) const {
+    if (roundedClipHandles.empty()) return;
+    // Clip contents is geometrically the SAME filled shape as the Frame.
+    // The former shader used a different superellipse SDF plus a hard AABB,
+    // causing 1px seams and jagged edges when white overlays touch a red
+    // rounded parent. Retain the actual Slug quadratics in the existing GPU
+    // curve/band streams, and reference them from the clip descriptor.
+    constexpr std::uint32_t wordsPerMask = 28u;
+    std::vector<std::uint32_t> offsets;
+    offsets.reserve(roundedClipHandles.size());
+    const auto bits = [](float value) { return std::bit_cast<std::uint32_t>(value); };
+    for (const auto& chain : roundedClipHandles) {
+      // Boolean intersection of axis-aligned rectangles in the SAME local
+      // coordinate frame is exactly another rectangle. Compile one shared
+      // Slug mask instead of independently antialiasing intersecting edges:
+      // min(coverageA,coverageB) is NOT the coverage of the intersection
+      // when two boundaries cross within one pixel. This also removes
+      // redundant curves, band reads, and GPU mask iterations.
+      // The overwhelmingly common single-mask chain is a zero-copy,
+      // zero-allocation fast path. Only multi-mask chains need compaction.
+      std::vector<RoundedClip> effectiveClips;
+      const std::vector<RoundedClip>* masks=chain.get();
+      bool emptyRectangleIntersection=false;
+      if(chain->size()>1u) {
+        effectiveClips.reserve(chain->size());
+        const auto isPlainRect=[](const RoundedClip& clip) noexcept {
+          const auto& r=clip.radii;
+          return r.topLeft<=0.0f && r.topRight<=0.0f &&
+                 r.bottomRight<=0.0f && r.bottomLeft<=0.0f;
+        };
+        for(const auto& clip:*chain) {
+          if(isPlainRect(clip)) {
+            auto existing=std::find_if(effectiveClips.begin(),effectiveClips.end(),
+              [&](const RoundedClip& other) {
+                return isPlainRect(other) &&
+                       other.inverseWorld==clip.inverseWorld &&
+                       other.projectiveLocal==clip.projectiveLocal;
+              });
+            if(existing!=effectiveClips.end()) {
+              const float left=std::max(existing->bounds.x,clip.bounds.x);
+              const float top=std::max(existing->bounds.y,clip.bounds.y);
+              const float right=std::min(existing->bounds.x+existing->bounds.width,
+                                         clip.bounds.x+clip.bounds.width);
+              const float bottom=std::min(existing->bounds.y+existing->bounds.height,
+                                          clip.bounds.y+clip.bounds.height);
+              // Disjoint rectangles in one coordinate frame reject the
+              // entire chain. Avoid both zero-sized curve compilation and
+              // subpixel ghost coverage caused by min(two AA edges).
+              if(right<=left || bottom<=top) {
+                emptyRectangleIntersection=true;
+                break;
+              }
+              existing->bounds={left,top,right-left,bottom-top};
+              continue;
+            }
+          }
+          effectiveClips.push_back(clip);
+        }
+        masks=&effectiveClips;
+      }
+      if(emptyRectangleIntersection) {
+        if(ir.dynamicBandWords.size() >= (1u << 24))
+          throw std::length_error("Empty clip storage exceeds GPU addressing");
+        offsets.push_back(static_cast<std::uint32_t>(ir.dynamicBandWords.size()));
+        // A reserved count marks a geometrically empty clip chain.
+        ir.dynamicBandWords.push_back(0xffffffffu);
+        continue;
+      }
+      if (ir.dynamicBandWords.size() >= (1u << 24))
+        throw std::length_error("Rounded clip storage exceeds GPU buffer addressing");
+      // Compile ALL mask paths before publishing this descriptor table. Slug
+      // compilation appends its own band records to the SAME buffer; inserting
+      // them between a clip-chain count and its descriptors corrupts indexing.
+      std::vector<std::uint32_t> descriptors;
+      descriptors.reserve(masks->size()*wordsPerMask);
+      for (const auto& clip : *masks) {
+        const auto radius = clip.radii;
+        std::array<Vec2,4> radii{{
+          {std::max(0.0f,radius.topLeft),std::max(0.0f,radius.topLeft)},
+          {std::max(0.0f,radius.topRight),std::max(0.0f,radius.topRight)},
+          {std::max(0.0f,radius.bottomRight),std::max(0.0f,radius.bottomRight)},
+          {std::max(0.0f,radius.bottomLeft),std::max(0.0f,radius.bottomLeft)}
+        }};
+        // The parent fill normalizes corner sums against the authored
+        // rectangle BEFORE forming Slug quadratics. Match it bit for bit.
+        float factor=1.0f;
+        const auto cap=[&](float extent,float sum) {
+          if(sum>extent&&sum>1.0e-8f)factor=std::min(factor,extent/sum);
+        };
+        cap(clip.bounds.width,radii[0].x+radii[1].x);
+        cap(clip.bounds.width,radii[3].x+radii[2].x);
+        cap(clip.bounds.height,radii[0].y+radii[3].y);
+        cap(clip.bounds.height,radii[1].y+radii[2].y);
+        factor=std::clamp(factor,0.0f,1.0f);
+        for(auto& r:radii)r=r*factor;
+        auto curves=roundedRectCurvesCached(
+          clip.bounds,radii,
+          config.enableContinuousCorners ? clip.smoothing : CornerSmoothing{});
+        DynamicVectorPathCommand geometry{
+          std::move(curves),clip.bounds,
+          {0.0f,0.0f,1000000.0f,1000000.0f},
+          Paint::solid(Color::fromRgb8(0xffffff)),
+          FillRule::NonZero,1.0f,true};
+        const std::size_t prior=ir.instances.size();
+        appendDynamicVectorPath(ir.instances,ir.dynamicCurves,
+                                ir.dynamicBandWords,geometry,false);
+        if(ir.instances.size()!=prior+1u)
+          throw std::logic_error("Unable to compile exact Clip contents vector");
+        const Instance outline=ir.instances.back();
+        ir.instances.pop_back(); // Geometry remains for fragment sampling.
+
+        // Do not hold a reference to ir.dynamicBandWords across the append
+        // above: building a new Slug path can reallocate that vector.
+        for(float field:{clip.bounds.x,clip.bounds.y,clip.bounds.width,
+                         clip.bounds.height,clip.radii.topLeft,
+                         clip.radii.topRight,clip.radii.bottomRight,
+                         clip.radii.bottomLeft,
+                         clip.smoothing.topLeftPercent,
+                         clip.smoothing.topRightPercent,
+                         clip.smoothing.bottomRightPercent,
+                         clip.smoothing.bottomLeftPercent})
+          descriptors.push_back(bits(field));
+        for(float field:clip.inverseWorld)
+          descriptors.push_back(bits(field));
+        descriptors.push_back(outline.shapeData[1]);
+        descriptors.push_back(outline.shapeData[2]);
+        descriptors.push_back(outline.shapeData[3]);
+        for(float field:outline.bandTransform)
+          descriptors.push_back(bits(field));
+        descriptors.push_back(bits(outline.positionRect[0]));
+        descriptors.push_back(bits(outline.positionRect[1]));
+        descriptors.push_back(clip.projectiveLocal ? 1u : 0u);
+      }
+      if(descriptors.size()!=masks->size()*wordsPerMask)
+        throw std::logic_error("Invalid exact rounded clip descriptor layout");
+      offsets.push_back(static_cast<std::uint32_t>(ir.dynamicBandWords.size()));
+      ir.dynamicBandWords.push_back(static_cast<std::uint32_t>(masks->size()));
+      ir.dynamicBandWords.insert(ir.dynamicBandWords.end(),descriptors.begin(),descriptors.end());
+    }
+    if(ir.dynamicBandWords.size()>=(1u<<24))
+      throw std::length_error("Rounded clip storage exceeds supported GPU buffer addressing");
+    for(auto& instance:ir.instances){
+      if((instance.roundedClipRef&0x80000000u)==0u)continue;
+      const auto index=(instance.roundedClipRef&0x7fffffffu)-1u;
+      if(index>=offsets.size())throw std::logic_error("Invalid rounded clip table handle");
+      instance.roundedClipRef=offsets[index]+1u;
+    }
+  }
+
+  void registerGradient(Instance& quad, const Paint& paintValue) const {
+    if (!hasGradientStopTable(paintValue.kind)) return;
+    if (!paintValue.stops || paintValue.stops->size() < 2)
+      throw std::invalid_argument("Gradient paint is missing its immutable stop table");
+    const auto* address = paintValue.stops.get();
+    const auto found = gradientHandleByAddress.find(address);
+    std::uint32_t index{};
+    if (found != gradientHandleByAddress.end() &&
+        gradientHandles[found->second].kind == paintValue.kind &&
+        gradientHandles[found->second].transform == paintValue.gradientTransform) {
+      index = found->second;
+    } else {
+      if (gradientHandles.size() >= (1u << 24))
+        throw std::length_error("Too many per-frame gradient tables");
+      index = static_cast<std::uint32_t>(gradientHandles.size());
+      gradientHandles.push_back({paintValue.stops, paintValue.kind,
+                                 paintValue.gradientTransform});
+      // Keep the first handle for a shared table; if its affine changes,
+      // register a separate descriptor without corrupting existing instances.
+      gradientHandleByAddress.try_emplace(address, index);
+    }
+    // Temporarily refers to a table index. compileRenderIR() converts this to
+    // the final dynamicBandWords offset once ALL Slug geometry has been encoded.
+    quad.paint[2] = -static_cast<float>(index + 1u);
+  }
+
+  void finishGradientTables(RenderIR& ir) const {
+    if (gradientHandles.empty()) return;
+    std::vector<std::uint32_t> offsets;
+    offsets.reserve(gradientHandles.size());
+    for (const auto& table : gradientHandles) {
+      if (ir.dynamicBandWords.size() >= (1u << 24))
+        throw std::length_error("Gradient table offset exceeds float-exact addressing");
+      offsets.push_back(static_cast<std::uint32_t>(ir.dynamicBandWords.size()));
+      ir.dynamicBandWords.push_back(static_cast<std::uint32_t>(table.stops->size()));
+      if (table.kind != GradientKind::LinearStops)
+        for (const auto value : table.transform)
+          ir.dynamicBandWords.push_back(std::bit_cast<std::uint32_t>(value));
+      for (const auto& stop : *table.stops) {
+        ir.dynamicBandWords.push_back(std::bit_cast<std::uint32_t>(stop.position));
+        ir.dynamicBandWords.push_back(std::bit_cast<std::uint32_t>(stop.color.r));
+        ir.dynamicBandWords.push_back(std::bit_cast<std::uint32_t>(stop.color.g));
+        ir.dynamicBandWords.push_back(std::bit_cast<std::uint32_t>(stop.color.b));
+        ir.dynamicBandWords.push_back(std::bit_cast<std::uint32_t>(stop.color.a));
+      }
+    }
+    if (ir.dynamicBandWords.size() >= (1u << 24))
+      throw std::length_error("Gradient tables exceed float-exact GPU address range");
+    for (auto& instance : ir.instances) {
+      if (!hasGradientStopTable(static_cast<GradientKind>(int(instance.paint[0]))) ||
+          instance.paint[2] >= 0.0f) continue;
+      const std::uint32_t index =
+          static_cast<std::uint32_t>(-instance.paint[2] - 1.0f);
+      if (index >= offsets.size()) throw std::logic_error("Invalid gradient handle");
+      instance.paint[2] = static_cast<float>(offsets[index]);
+    }
+  }
+
   void appendResolvedShape(std::vector<Instance>& instances, const slughorn::Atlas::Shape& shape,
                            Rect destination, const Paint& paintValue, Rect clip,
                            float italicShear = 0.0f) const {
@@ -1760,6 +2027,7 @@ struct VulkanRenderer::Impl {
     quad.clip[1] = clip.y;
     quad.clip[2] = clip.width;
     quad.clip[3] = clip.height;
+    registerGradient(quad, paintValue);
     instances.push_back(quad);
   }
 
@@ -1786,6 +2054,8 @@ struct VulkanRenderer::Impl {
   }
 
   [[nodiscard]] bool compactRectangleCompatible(const RoundedRectCommand& command) const noexcept {
+    if(command.fillLayers) return false;
+    if (command.roundedClips && !command.roundedClips->empty()) return false;
     const auto& color = command.paint.start;
     const auto widths = resolvedBorderWidths(command.border);
     const bool borderInvisible = widths.maximum() <= 0.0f || paintFullyTransparent(command.border.paint);
@@ -2381,6 +2651,7 @@ struct VulkanRenderer::Impl {
     quad.gradient[2] = paint.target.x; quad.gradient[3] = paint.target.y;
     quad.clip[0] = command.clip.x; quad.clip[1] = command.clip.y;
     quad.clip[2] = command.clip.width; quad.clip[3] = command.clip.height;
+    registerGradient(quad, paint);
     instances.push_back(quad);
   }
 
@@ -2455,9 +2726,37 @@ struct VulkanRenderer::Impl {
       {command.radiiPx.bottomRight,command.radiiPx.bottomRight},
       {command.radiiPx.bottomLeft,command.radiiPx.bottomLeft}}};
 
-    if(!hasBorder){
+    // Figma's corner radius may be larger than half the frame height
+    // (e.g. radius=50 on a 36px pill). Normalize ONCE against the authored
+    // outline BEFORE constructing each inset/outset stroke contour.
+    // Previously, outer and inner were normalized independently after
+    // subtracting border widths. For unequal top/right/bottom/left widths
+    // that changes the ellipse centers and moves its inner boundary by
+    // multiple pixels near the corners.
+    auto effectiveXY=authoredXY;
+    for(auto& radius:effectiveXY){
+      radius.x=std::max(0.0f,radius.x);
+      radius.y=std::max(0.0f,radius.y);
+      if(radius.x<=1.0e-7f||radius.y<=1.0e-7f) radius={0.0f,0.0f};
+    }
+    float radiusScale=1.0f;
+    const auto fitRadius=[&](float extent,float sum){
+      if(sum>extent && sum>1.0e-8f)
+        radiusScale=std::min(radiusScale,extent/sum);
+    };
+    fitRadius(command.destination.width,effectiveXY[0].x+effectiveXY[1].x);
+    fitRadius(command.destination.width,effectiveXY[3].x+effectiveXY[2].x);
+    fitRadius(command.destination.height,effectiveXY[0].y+effectiveXY[3].y);
+    fitRadius(command.destination.height,effectiveXY[1].y+effectiveXY[2].y);
+    for(auto& radius:effectiveXY) radius=radius*radiusScale;
+
+    const bool hasMaskedStack =
+      command.compositeLayers && !command.compositeLayers->empty();
+    const bool hasFillStack = hasMaskedStack ||
+      (command.fillLayers && !command.fillLayers->empty());
+    if(!hasBorder && !hasFillStack) {
       emit(roundedRectCurvesCached(
-             command.destination,authoredXY,smoothing),
+             command.destination,effectiveXY,smoothing),
            command.destination,command.paint);
       return;
     }
@@ -2471,8 +2770,8 @@ struct VulkanRenderer::Impl {
       std::max(0.0f,command.destination.width-(widths.left+widths.right)*inside),
       std::max(0.0f,command.destination.height-(widths.top+widths.bottom)*inside)};
 
-    auto outerR=authoredXY;
-    auto innerR=authoredXY;
+    auto outerR=effectiveXY;
+    auto innerR=effectiveXY;
     const std::array<Vec2,4> outsideDelta{{
       {widths.left*outside,widths.top*outside},
       {widths.right*outside,widths.top*outside},
@@ -2484,7 +2783,7 @@ struct VulkanRenderer::Impl {
       {widths.right*inside,widths.bottom*inside},
       {widths.left*inside,widths.bottom*inside}}};
     for(std::size_t i=0;i<4;++i){
-      const bool rounded=authoredXY[i].x>1.0e-6f||authoredXY[i].y>1.0e-6f;
+      const bool rounded=effectiveXY[i].x>1.0e-6f||effectiveXY[i].y>1.0e-6f;
       if(rounded){
         outerR[i]=outerR[i]+outsideDelta[i];
         innerR[i].x=std::max(0.0f,innerR[i].x-insideDelta[i].x);
@@ -2493,6 +2792,142 @@ struct VulkanRenderer::Impl {
         outerR[i]={0.0f,0.0f};
         innerR[i]={0.0f,0.0f};
       }
+    }
+
+    // A stroke and its underlying fill must share ONE AA silhouette.
+    // Separately compositing two anti-aliased contours as source-over would
+    // produce F + R*(1-F), which exceeds the original coverage at a fractional
+    // inside edge. Our single-pass composite evaluates outer, authored and
+    // inner Slug contours at the exact same fragment position and partitions
+    // their covered areas. The band descriptor is rebased alongside Slug
+    // curves when this DrawList is nested in a projected Figma node.
+    if(command.border.paint.kind==GradientKind::Solid &&
+       !command.border.paint.stops) {
+      const Paint auxiliaryPaint=Paint::solid(Color::fromRgb8(0xffffff));
+      const auto makePath=[&](std::vector<QuadraticBezier2D> curves,
+                              Rect rect, Paint paint) {
+        DynamicVectorPathCommand path{
+          std::move(curves),rect,command.clip,paint,FillRule::NonZero,1.0f,true};
+        const std::size_t first=instances.size();
+        appendDynamicVectorPath(instances,curveData,bandWords,path,false);
+        if(instances.size()!=first+1)
+          throw std::logic_error("Rounded border coverage path must emit one Slug instance");
+        const Instance result=instances.back();
+        instances.pop_back(); // GPU curves/bands remain addressable.
+        return result;
+      };
+      const Instance baseShape=makePath(
+        roundedRectCurvesCached(command.destination,effectiveXY,smoothing),
+        command.destination,auxiliaryPaint);
+      const bool hasInner=inner.width>0.0f&&inner.height>0.0f;
+      Instance innerShape{};
+      if(hasInner)
+        innerShape=makePath(roundedRectCurvesCached(inner,innerR,smoothing),
+                            inner,auxiliaryPaint);
+      // The rendered outer quad uses the original fill/gradient paint so that
+      // the normal gradient resource pipeline and ordering stay intact.
+      Paint outerPaint=command.paint;
+      const float fillOpacity=paintFullyTransparent(command.paint)
+        ? 0.0f : command.paint.opacity;
+      if(paintFullyTransparent(outerPaint))
+        outerPaint=auxiliaryPaint;
+      outerPaint.opacity=1.0f;
+      Instance outerShape=makePath(
+        roundedRectCurvesCached(outer,outerR,smoothing),outer,outerPaint);
+
+      // Pack immutable per-command geometry into the existing dynamic band
+      // SSBO; no new descriptor set, staging buffer or render pass required.
+      // Words [0..3] stroke RGBA, [4] stroke opacity, [5] fill opacity;
+      // [6..14] authored contour, [15..23] inside contour,
+      // [24..27] authored UV mapping relative to outer's emCoord.
+      const std::size_t layerCount=hasMaskedStack
+        ? command.compositeLayers->size()
+        : (hasFillStack ? command.fillLayers->size() : 0u);
+      constexpr std::size_t layeredPaintWords=14u;
+      constexpr std::size_t layeredMaskWords=16u;
+      const std::size_t wordsPerLayer=layeredPaintWords+
+        (hasMaskedStack?layeredMaskWords:0u);
+      if(bandWords.size()+28u+(layerCount==0 ? 0 : 1u+wordsPerLayer*layerCount) >= (1u << 24))
+        throw std::length_error("Fused border descriptor exceeds float-exact addressing");
+      const std::uint32_t descriptor=static_cast<std::uint32_t>(bandWords.size());
+      const auto word=[&](float value) {
+        bandWords.push_back(std::bit_cast<std::uint32_t>(value));
+      };
+      const auto& borderPaint=command.border.paint;
+      word(borderPaint.start.r);word(borderPaint.start.g);
+      word(borderPaint.start.b);word(borderPaint.start.a);
+      word(borderPaint.opacity);word(fillOpacity);
+      const auto appendSecondary=[&](const Instance& shape,bool valid) {
+        bandWords.push_back(valid ? shape.shapeData[1] : 0u);
+        bandWords.push_back(valid ? shape.shapeData[2] : 0u);
+        bandWords.push_back(valid ? shape.shapeData[3] : 0xffffffffu);
+        for(float v:shape.bandTransform)word(valid ? v : 0.0f);
+        word(valid ? outerShape.positionRect[0]-shape.positionRect[0] : 0.0f);
+        word(valid ? outerShape.positionRect[1]-shape.positionRect[1] : 0.0f);
+      };
+      appendSecondary(baseShape,true);
+      appendSecondary(innerShape,hasInner);
+      word((outerShape.positionRect[0]-command.destination.x) /
+           std::max(command.destination.width,1.0e-8f));
+      word((outerShape.positionRect[1]-command.destination.y) /
+           std::max(command.destination.height,1.0e-8f));
+      word(1.0f/std::max(command.destination.width,1.0e-8f));
+      word(1.0f/std::max(command.destination.height,1.0e-8f));
+      if(hasFillStack) {
+        if(layerCount>(hasMaskedStack?32u:64u))
+          throw std::invalid_argument("Rounded paint stack exceeds supported layer count");
+        bandWords.push_back(static_cast<std::uint32_t>(layerCount));
+        const auto appendPaint=[&](const Paint& layer) {
+          if(layer.kind!=GradientKind::Solid&&layer.kind!=GradientKind::Linear)
+            throw std::invalid_argument("Only Solid/Linear paints support one-pass rounded stacks");
+          bandWords.push_back(static_cast<std::uint32_t>(layer.kind));
+          word(layer.start.r);word(layer.start.g);
+          word(layer.start.b);word(layer.start.a);
+          word(layer.end.r);word(layer.end.g);
+          word(layer.end.b);word(layer.end.a);
+          word(layer.origin.x);word(layer.origin.y);
+          word(layer.target.x);word(layer.target.y);
+          word(layer.opacity);
+        };
+        if(hasMaskedStack) {
+          // Each layer carries an optional Slug atlas shape and its exact
+          // authored geometry transform. Evaluate all child paints into a
+          // single *unmasked* premultiplied stack, then multiply the shared
+          // Frame Slug contour once. This fixes boundary overdraw in clipped
+          // checker patterns and alpha gradients with no offscreen texture.
+          for(const auto& layer:*command.compositeLayers) {
+            appendPaint(layer.paint);
+            Instance child{};
+            bool hasShape=false;
+            if(layer.shape!=0u) {
+              std::vector<Instance> single;
+              appendShape(single,layer.shape,layer.destination,
+                          Paint::solid(Color::fromRgb8(0xffffff)),
+                          command.clip,0.0f);
+              if(single.size()!=1u)
+                throw std::logic_error("Masked atlas paint must resolve to one Slug quad");
+              child=single.front();
+              hasShape=true;
+            }
+            for(int k=0;k<4;++k)
+              bandWords.push_back(hasShape?child.shapeData[k]:0xffffffffu);
+            for(int k=0;k<4;++k)word(hasShape?child.bandTransform[k]:0.0f);
+            for(int k=0;k<4;++k)word(hasShape?child.positionRect[k]:
+              (k==0?command.destination.x:k==1?command.destination.y:
+               k==2?command.destination.x+command.destination.width:
+                    command.destination.y+command.destination.height));
+            for(int k=0;k<4;++k)word(hasShape?child.emRect[k]:0.0f);
+          }
+          outerShape.shapeData[3]|=0x00200000u;
+        }else{
+          for(const auto& layer:*command.fillLayers)appendPaint(layer);
+        }
+        outerShape.shapeData[3]|=0x00400000u;
+      }
+      outerShape.shapeData[3]|=0x00800000u;
+      outerShape.strokeWidths[0]=static_cast<float>(descriptor);
+      instances.push_back(std::move(outerShape));
+      return;
     }
 
     auto borderCurves=roundedRectCurvesCached(
@@ -2504,15 +2939,17 @@ struct VulkanRenderer::Impl {
                           std::make_move_iterator(hole.begin()),std::make_move_iterator(hole.end()));
     }
 
-    const bool opaqueBorder=paintFullyOpaque(command.border.paint);
-    if(!opaqueBorder)
-      emit(roundedRectCurvesCached(
-             command.destination,authoredXY,smoothing),
-           command.destination,command.paint);
+    // Figma paints a Frame's fill over its ORIGINAL geometry and places the
+    // stroke on top. The old opaque-border optimization drew the inner fill
+    // *after* the stroke with bounds=inner, changing the gradient's local UV
+    // system and moving its colors by the stroke inset. It also let the
+    // inner-fill's AA fringe cover the stroke's own anti-aliased inner edge.
+    // Keep the painted shape and its color mapping independent of stroke
+    // alignment/width, including opaque borders and rounded inner corners.
+    emit(roundedRectCurvesCached(
+           command.destination,effectiveXY,smoothing),
+         command.destination,command.paint);
     emit(std::move(borderCurves),outer,command.border.paint);
-    if(opaqueBorder&&!paintFullyTransparent(command.paint)&&inner.width>0.0f&&inner.height>0.0f)
-      emit(roundedRectCurvesCached(inner,innerR,smoothing),
-           inner,command.paint);
   }
 
   static void appendGeometryFloat(std::string& key, float value) {
@@ -3080,7 +3517,7 @@ struct VulkanRenderer::Impl {
   std::size_t uploadRetainedDynamic(RetainedGeometry &retained,
                                     const std::vector<DynamicSlugCurve> &curves,
                                     const std::vector<std::uint32_t> &bands) {
-    if (curves.empty() || bands.empty()) {
+    if (bands.empty()) {
       if (retained.dynamicDescriptorPool != VK_NULL_HANDLE ||
           retained.dynamicCurves.buffer != VK_NULL_HANDLE ||
           retained.dynamicBands.buffer != VK_NULL_HANDLE) {
@@ -3091,14 +3528,15 @@ struct VulkanRenderer::Impl {
       return 0;
     }
 
-    const VkDeviceSize curveBytes = curves.size() * sizeof(DynamicSlugCurve);
+    const VkDeviceSize curveBytes = std::max<std::size_t>(1, curves.size()) * sizeof(DynamicSlugCurve);
     const VkDeviceSize bandBytes = bands.size() * sizeof(std::uint32_t);
     const bool recreate = retained.dynamicDescriptorSet == VK_NULL_HANDLE ||
                           retained.dynamicCurves.size < curveBytes ||
                           retained.dynamicBands.size < bandBytes;
     if (!recreate) {
-      if (std::memcmp(retained.dynamicCurves.mapped, curves.data(),
-                      static_cast<std::size_t>(curveBytes)) == 0 &&
+      if ((curves.empty() ||
+           std::memcmp(retained.dynamicCurves.mapped, curves.data(),
+                       curves.size() * sizeof(DynamicSlugCurve)) == 0) &&
           std::memcmp(retained.dynamicBands.mapped, bands.data(),
                       static_cast<std::size_t>(bandBytes)) == 0)
         return 0;
@@ -3141,8 +3579,9 @@ struct VulkanRenderer::Impl {
       writeDynamicDescriptorSet(retained.dynamicDescriptorSet,
                                 retained.dynamicCurves, retained.dynamicBands);
     }
-    std::memcpy(retained.dynamicCurves.mapped, curves.data(),
-                static_cast<std::size_t>(curveBytes));
+    if (!curves.empty())
+      std::memcpy(retained.dynamicCurves.mapped, curves.data(),
+                  curves.size() * sizeof(DynamicSlugCurve));
     std::memcpy(retained.dynamicBands.mapped, bands.data(),
                 static_cast<std::size_t>(bandBytes));
     return static_cast<std::size_t>(curveBytes + bandBytes);
@@ -3692,6 +4131,39 @@ struct VulkanRenderer::Impl {
         paint.end={source.color1[0],source.color1[1],source.color1[2],source.color1[3]};
         paint.opacity=source.paint[1]*opacity;paint.shaderParameter=source.paint[2];
         paint.origin={source.gradient[0],source.gradient[1]};paint.target={source.gradient[2],source.gradient[3]};
+        if (hasGradientStopTable(paint.kind)) {
+          if (retained.dynamicBands.mapped == nullptr)
+            throw std::logic_error("Retained multistop gradient is missing its stop table");
+          const auto* words = static_cast<const std::uint32_t*>(retained.dynamicBands.mapped);
+          const auto base = static_cast<std::uint32_t>(source.paint[2]);
+          const auto count = words[base];
+          const auto metadata = paint.kind == GradientKind::LinearStops ? 0u : 6u;
+          if (count < 2 || count > 256 ||
+              std::uint64_t(base) + 1u + metadata + std::uint64_t(count) * 5u >
+                  retained.dynamicBands.size / sizeof(std::uint32_t))
+            throw std::logic_error("Invalid retained gradient stop table");
+          std::array<float,6> transform{1,0,0,0,1,0};
+          if (metadata)
+            for (std::uint32_t i = 0; i < 6u; ++i)
+              transform[i] = std::bit_cast<float>(words[base + 1u + i]);
+          std::vector<GradientStop> stops;
+          stops.reserve(count);
+          for (std::uint32_t n = 0; n < count; ++n) {
+            const auto offset = base + 1u + metadata + n * 5u;
+            stops.push_back({
+              std::bit_cast<float>(words[offset]),
+              {std::bit_cast<float>(words[offset + 1u]),
+               std::bit_cast<float>(words[offset + 2u]),
+               std::bit_cast<float>(words[offset + 3u]),
+               std::bit_cast<float>(words[offset + 4u])}});
+          }
+          if (paint.kind == GradientKind::LinearStops)
+            paint = Paint::linearStops(std::span<const GradientStop>(stops), paint.origin,
+                                       paint.target, paint.opacity);
+          else
+            paint = Paint::figmaStops(paint.kind, std::span<const GradientStop>(stops),
+                                      transform, paint.opacity);
+        }
         DynamicVectorPathCommand command{std::move(visible),{},clip,paint,evenOdd?FillRule::EvenOdd:FillRule::NonZero};
         command.bounds=quadraticBounds(command.curves);
         const auto before=ir.instances.size();
@@ -3712,6 +4184,11 @@ struct VulkanRenderer::Impl {
   }
 
   void compileRenderIR(const DrawList& list, RenderIR& ir, bool forFrame) {
+    // Reinitialize all per-IR handles before any path/shape is appended.
+    gradientHandles.clear();
+    gradientHandleByAddress.clear();
+    roundedClipHandles.clear();
+    roundedClipHandleByAddress.clear();
     ir.clear();
     frameDynamicShapeLocations.clear();
     auto& instances = ir.instances;
@@ -3732,23 +4209,81 @@ struct VulkanRenderer::Impl {
           if(!projected->content||projected->opacity<=0||projected->clip.width<=0||projected->clip.height<=0)continue;
           if(!forFrame)throw std::invalid_argument("A projected DrawList cannot be retained or nested");
           RenderIR content;
-          compileRenderIR(*projected->content,content,false);
+          // Inner projected lists get their own gradient/rounded-mask handles,
+          // but must not reset the enclosing frame's already pending tables.
+          auto savedGradientHandles = std::move(gradientHandles);
+          auto savedGradientByAddress = std::move(gradientHandleByAddress);
+          auto savedRoundedHandles = std::move(roundedClipHandles);
+          auto savedRoundedByAddress = std::move(roundedClipHandleByAddress);
+          try {
+            compileRenderIR(*projected->content,content,false);
+          } catch (...) {
+            gradientHandles = std::move(savedGradientHandles);
+            gradientHandleByAddress = std::move(savedGradientByAddress);
+            roundedClipHandles = std::move(savedRoundedHandles);
+            roundedClipHandleByAddress = std::move(savedRoundedByAddress);
+            throw;
+          }
+          gradientHandles = std::move(savedGradientHandles);
+          gradientHandleByAddress = std::move(savedGradientByAddress);
+          roundedClipHandles = std::move(savedRoundedHandles);
+          roundedClipHandleByAddress = std::move(savedRoundedByAddress);
           const auto instanceBase=static_cast<std::uint32_t>(instances.size());
           const auto curveBase=static_cast<std::uint32_t>(dynamicCurves.size());
           const auto bandBase=static_cast<std::uint32_t>(dynamicBandWords.size());
           dynamicCurves.insert(dynamicCurves.end(),content.dynamicCurves.begin(),content.dynamicCurves.end());
           dynamicBandWords.insert(dynamicBandWords.end(),content.dynamicBandWords.begin(),content.dynamicBandWords.end());
           std::set<std::uint32_t> rebased;
+          std::set<std::uint32_t> rebasedClipTables;
+          const auto rebaseBandHeaders = [&](std::uint32_t block, std::uint32_t flags) {
+            if ((flags & 0x80000000u) != 0u || !rebased.insert(block).second) return;
+            const auto headers=(flags&255u)+((flags>>8u)&255u)+2u;
+            for(std::uint32_t header=0;header<headers;++header)
+              dynamicBandWords[bandBase+block+64u+2u*header+1u]+=bandBase;
+          };
           for(auto& quad:content.instances){
             quad.paint[1]*=projected->opacity;
-            if(quad.shapeData[0]==0xFFFFFFF8U&&(quad.shapeData[3]&0x80000000u)==0){
-              const auto block=quad.shapeData[2];
-              if(rebased.insert(block).second){
-                const auto headers=(quad.shapeData[3]&255u)+((quad.shapeData[3]>>8u)&255u)+2u;
-                for(std::uint32_t header=0;header<headers;++header)
-                  dynamicBandWords[bandBase+block+64u+2u*header+1u]+=bandBase;
+            if(hasGradientStopTable(static_cast<GradientKind>(int(quad.paint[0]))))
+              quad.paint[2] += static_cast<float>(bandBase);
+            if(quad.roundedClipRef != 0u) {
+              const auto table=quad.roundedClipRef-1u;
+              if(rebasedClipTables.insert(table).second) {
+                const auto count=dynamicBandWords[bandBase+table];
+                for(std::uint32_t i=0u;i<count;++i) {
+                  const auto at=bandBase+table+1u+i*28u+18u;
+                  const auto flags=dynamicBandWords[at+2u];
+                  rebaseBandHeaders(dynamicBandWords[at+1u],flags);
+                  if((flags&0x80000000u)==0u) {
+                    dynamicBandWords[at]+=curveBase;
+                    dynamicBandWords[at+1u]+=bandBase;
+                  }
+                }
               }
-              quad.shapeData[1]+=curveBase;quad.shapeData[2]+=bandBase;
+              quad.roundedClipRef += bandBase;
+            }
+            if(quad.shapeData[0]==0xFFFFFFF8U) {
+              if((quad.shapeData[3]&0x00800000u)!=0u) {
+                // The fused stroke descriptor references TWO more Slug shape
+                // stream locations. These are not drawn as standalone
+                // instances, so the usual instance rebase would miss them.
+                const auto descriptor=static_cast<std::uint32_t>(quad.strokeWidths[0]);
+                for(const auto shapeOffset: {6u,15u}) {
+                  const auto at=bandBase+descriptor+shapeOffset;
+                  const auto flags=dynamicBandWords[at+2u];
+                  if(flags==0xffffffffu) continue;
+                  rebaseBandHeaders(dynamicBandWords[at+1u],flags);
+                  if((flags&0x80000000u)==0u) {
+                    dynamicBandWords[at]+=curveBase;
+                    dynamicBandWords[at+1u]+=bandBase;
+                  }
+                }
+                quad.strokeWidths[0]+=static_cast<float>(bandBase);
+              }
+              if((quad.shapeData[3]&0x80000000u)==0u) {
+                rebaseBandHeaders(quad.shapeData[2],quad.shapeData[3]);
+                quad.shapeData[1]+=curveBase;
+                quad.shapeData[2]+=bandBase;
+              }
             }
             instances.push_back(quad);
           }
@@ -3855,6 +4390,33 @@ struct VulkanRenderer::Impl {
           }
           continue;
         }
+        const auto& roundedClips = std::visit(
+          [](const auto& command) -> const RoundedClipChain& { return command.roundedClips; },
+          display);
+        if (roundedClips && !roundedClips->empty()) {
+          // The normal nonprojected clip rectangle path is sufficient when
+          // every ancestor mask is an unrotated axis-aligned rectangle.
+          const bool nativeRectangles = forFrame && std::all_of(
+            roundedClips->begin(), roundedClips->end(), [](const RoundedClip& mask) {
+              const auto& t = mask.inverseWorld;
+              const auto aligned = [](float edge) {
+                return std::abs(edge-std::round(edge)) <= 0.0001f;
+              };
+              return mask.radii.topLeft <= 0.0f &&
+                mask.radii.topRight <= 0.0f &&
+                mask.radii.bottomLeft <= 0.0f &&
+                mask.radii.bottomRight <= 0.0f &&
+                t == std::array<float,6>{1,0,0, 0,1,0} &&
+                // Fractional rectangular clip edges require the same
+                // Slug coverage as other shapes. Native scissor is binary.
+                aligned(mask.bounds.x) && aligned(mask.bounds.y) &&
+                aligned(mask.bounds.x+mask.bounds.width) &&
+                aligned(mask.bounds.y+mask.bounds.height);
+            });
+          if (!nativeRectangles)
+            for (std::size_t i = first; i < instances.size(); ++i)
+              registerRoundedClips(instances[i], roundedClips);
+        }
         const float opacity = std::visit([](const auto& command) { return command.opacity; }, display);
         if (opacity < 1.0f)
           for (std::size_t i = first; i < instances.size(); ++i) instances[i].paint[1] *= opacity;
@@ -3878,6 +4440,12 @@ struct VulkanRenderer::Impl {
     };
     appendCommands(list.commands());
     appendCommands(list.overlayCommands());
+    finishGradientTables(ir);
+    finishRoundedClipTables(ir);
+    gradientHandles.clear();
+    gradientHandleByAddress.clear();
+    roundedClipHandles.clear();
+    roundedClipHandleByAddress.clear();
   }
 
   void ensureCapacity(Buffer& buffer, VkDeviceSize required, VkBufferUsageFlags usage) {

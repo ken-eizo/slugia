@@ -22,7 +22,7 @@
       color: var(--figma-color-text-secondary);
       background: var(--figma-color-bg-secondary);
     }
-    .actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }
     button {
       min-height: 32px;
       padding: 6px 10px;
@@ -70,6 +70,7 @@
     <div>
       <h1>SlugUI Exporter</h1>
       <div class="muted">Selection → typed .slugui → AOT C++</div>
+      <div id="build-revision" class="native" style="font-weight:600;margin-top:4px;">Fidelity exporter v6 · 2026-11-22</div>
     </div>
     <button id="close" aria-label="Close">Close</button>
   </header>
@@ -86,11 +87,13 @@
     <button id="refresh">Refresh</button>
     <button id="copy">Copy</button>
     <button class="primary" id="download">Download .slugui</button>
+    <button id="reference">Figma PNG</button>
   </div>
 
   <textarea id="source" readonly spellcheck="false"
     placeholder="Select a Frame, Component, or node in Figma."></textarea>
   <div id="status" class="muted"></div>
+  <div id="paint-summary" class="muted"></div>
   <h2>Fidelity diagnostics</h2>
   <div id="diagnostics"></div>
 
@@ -159,6 +162,22 @@
         }
         return;
       }
+      if (message.type === "reference-error") {
+        status.textContent = "Figma PNG error: " + message.message;
+        return;
+      }
+      if (message.type === "reference-payload") {
+        const bytes = new Uint8Array(message.png || []);
+        if (bytes.length === 0) return;
+        const url = URL.createObjectURL(new Blob([bytes], {type:"image/png"}));
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = message.filename || "Figma-reference.png";
+        anchor.click();
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+        status.textContent = "Native Figma PNG exported: " + anchor.download;
+        return;
+      }
       if (message.type !== "export-result") return;
       state.source = message.source || "";
       state.sourceAvailable = Boolean(message.sourceAvailable || state.source);
@@ -177,6 +196,15 @@
       document.getElementById("approximated").textContent = counts.approximated + " approximated";
       document.getElementById("unsupported").textContent = counts.unsupported + " unsupported";
       const stats = message.stats || {};
+      const gradientCount = stats.gradientPaintCount || 0;
+      const multistopCount = stats.multistopGradientCount || 0;
+      const flatCount = stats.flatGradientCount || 0;
+      document.getElementById("paint-summary").textContent =
+        gradientCount + " gradient paints · " + multistopCount + " multistop · " +
+        flatCount + " flat / identical-stop · " + (stats.mirroredNodeCount || 0) +
+        " mirrored nodes.";
+      document.getElementById("build-revision").textContent =
+        "Fidelity exporter " + (message.exporterRevision || "UNKNOWN BUILD");
       const timing = typeof stats.generationMs === "number"
         ? " · " + stats.generationMs + " ms"
         : "";
@@ -221,6 +249,7 @@
     }
 
     document.getElementById("refresh").onclick = () => send("refresh");
+    document.getElementById("reference").onclick = () => send("reference-png");
     document.getElementById("close").onclick = () => send("close");
     copy.onclick = () => {
       if (!state.sourceAvailable) return;

@@ -17,6 +17,7 @@ struct DrawCommand {
   Paint paint = {};
   float italicShear = 0.0f;
   float opacity = 1.0f;
+  RoundedClipChain roundedClips{};
 };
 
 struct TextCommand {
@@ -28,10 +29,22 @@ struct TextCommand {
   TextStyle style = {};
   float runScale = 1.0f;
   float opacity = 1.0f;
+  RoundedClipChain roundedClips{};
 
   [[nodiscard]] std::string_view text() const {
     return borrowedUtf8.data() ? borrowedUtf8 : std::string_view(utf8);
   }
+};
+
+// A clipped Frame can be composited at the same fragment as its contained
+// atlas shapes. This avoids repeating the rounded-mask AA on the frame,
+// checker pattern, and translucent overlays (a source-over group artifact).
+// shape==0 denotes a full-bleed paint; for a shape the paint's coordinates
+// are relative to that shape's original destination.
+struct MaskedFillLayer {
+  Paint paint{};
+  ShapeId shape = 0;
+  Rect destination{};
 };
 
 struct RoundedRectCommand {
@@ -42,6 +55,14 @@ struct RoundedRectCommand {
   Paint paint = {};
   BorderStyle border = {};
   float opacity = 1.0f;
+  RoundedClipChain roundedClips{};
+  // Resolved Figma paint stack: evaluated once per fragment BEFORE AA coverage.
+  // Individual draw calls would repeatedly apply the same fractional edge
+  // mask, creating a bright halo beneath the inside stroke.
+  std::shared_ptr<const std::vector<Paint>> fillLayers{};
+  // Adjacent solid/linear clipped atlas shapes/overlays, in painter order.
+  // Their colors are composited BEFORE one shared parent contour coverage.
+  std::shared_ptr<const std::vector<MaskedFillLayer>> compositeLayers{};
 };
 
 // Screen-space vector commands remain semantic geometry. At frame-build time they are
@@ -53,6 +74,7 @@ struct LineCommand {
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
   StrokeStyle style = {};
   float opacity = 1.0f;
+  RoundedClipChain roundedClips{};
 };
 
 struct DynamicVectorPathCommand {
@@ -65,6 +87,7 @@ struct DynamicVectorPathCommand {
   bool cacheable = false;
   // Coverage accumulation follows a shared union mask; used for adjacent 3D materials.
   bool additiveCoverage = false;
+  RoundedClipChain roundedClips{};
 };
 
 struct CubicBezierCommand {
@@ -75,6 +98,7 @@ struct CubicBezierCommand {
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
   StrokeStyle style = {};
   float opacity = 1.0f;
+  RoundedClipChain roundedClips{};
 };
 
 struct RetainedTextCommand {
@@ -84,6 +108,7 @@ struct RetainedTextCommand {
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
   float opacity = 1.0f;
   std::optional<View2D> view;
+  RoundedClipChain roundedClips{};
 };
 
 struct RetainedDrawListCommand {
@@ -93,6 +118,7 @@ struct RetainedDrawListCommand {
   Rect clip = {0.0f, 0.0f, 100000.0f, 100000.0f};
   float opacity = 1.0f;
   std::optional<View2D> view;
+  RoundedClipChain roundedClips{};
 };
 
 // Circular centerline source. VulkanRenderer lowers its stroked outline to quadratic
@@ -105,6 +131,7 @@ struct ArcCommand {
   Rect clip = {};
   StrokeStyle style = {};
   float opacity = 1.0f;
+  RoundedClipChain roundedClips{};
 };
 
 struct ExternalImageCommand {
@@ -114,6 +141,7 @@ struct ExternalImageCommand {
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   float opacity = 1.0f;
+  RoundedClipChain roundedClips{};
 };
 
 class DrawList;
@@ -122,6 +150,7 @@ struct ProjectedDrawListCommand {
   ProjectiveTransform2D transform{};
   Rect clip{};
   float opacity=1.0f;
+  RoundedClipChain roundedClips{};
 };
 
 using DisplayCommand = std::variant<DrawCommand, TextCommand, RoundedRectCommand,
@@ -147,6 +176,12 @@ public:
   }
   [[nodiscard]] Rect clip() const {
     return clip_;
+  }
+  void setRoundedClips(RoundedClipChain roundedClips) {
+    roundedClips_ = std::move(roundedClips);
+  }
+  [[nodiscard]] const RoundedClipChain& roundedClips() const {
+    return roundedClips_;
   }
 
   // Overlay commands are emitted after all regular commands while staying in the same GPU batch.
@@ -178,6 +213,12 @@ public:
   // differs. Radii remain absolute framebuffer pixels after destination sizing.
   void roundedRect(Rect destination, CornerRadii radiiPx, Paint paint,
                    CornerSmoothing continuousCorners = {}, BorderStyle border = {});
+  // Single-silhouette native paint stack. Compatible with Solid/Linear layers
+  // without extra offscreen buffers; other paints can use separate draw calls.
+  void roundedRectLayers(Rect destination, CornerRadii radiiPx,
+                         std::vector<Paint> paints,
+                         CornerSmoothing continuousCorners = {},
+                         BorderStyle border = {});
   void line(Vec2 from, Vec2 to, StrokeStyle style);
   void dynamicVectorPath(std::vector<QuadraticBezier2D> curves, Rect bounds, Paint paint,
                          FillRule fillRule = FillRule::NonZero, bool cacheable = false,
@@ -212,6 +253,7 @@ public:
 
 private:
   Rect clip_ = {0.0f, 0.0f, 100000.0f, 100000.0f};
+  RoundedClipChain roundedClips_{};
   std::vector<DisplayCommand> commands_{};
   std::vector<DisplayCommand> overlayCommands_{};
   bool overlayMode_ = false;

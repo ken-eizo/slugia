@@ -235,6 +235,9 @@ struct ImagePlaceholderSpec {
 
 struct RoundedRectangleVisual {
   StatefulPaint paint = {};
+  // Multi-fill paints in Figma's bottom-to-top order. Empty preserves
+  // the allocation-free historical single-paint fast path.
+  std::vector<StatefulPaint> fillLayers = {};
   ValueSource<CornerRadii> radii = CornerRadii{};
   ValueSource<CornerSmoothing> smoothing = CornerSmoothing{};
   StrokeVisual stroke = {};
@@ -286,6 +289,9 @@ struct Element {
   std::string name;
   SourceMetadata source = {};
   LayoutSpec layout = {};
+  // 2x2 Figma local basis (a,b,c,d), applied around the resolved layout origin.
+  // Translation remains the job of layout, avoiding double application in nested frames.
+  std::array<float,4> localTransform{1.0f, 0.0f, 0.0f, 1.0f};
   ValueSource<bool> visible = true;
   bool clipsChildren = false;
   bool overlay = false;

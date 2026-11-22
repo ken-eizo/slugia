@@ -32,6 +32,21 @@ class SlugUiCompilerTest(unittest.TestCase):
         self.assertIn("callback_toggle_popup", first)
         self.assertIn("ImportFidelity::Native", first)
 
+    def test_source_fingerprint_is_stable_and_changes_with_source(self):
+        source = "component Test { Rectangle box { width: 20px; } }\n"
+        changed = source.replace("20px", "21px")
+        generated = compiler.compile_text(source, "test.slugui", "example")
+        again = compiler.compile_text(source, "test.slugui", "example")
+        updated = compiler.compile_text(changed, "test.slugui", "example")
+        self.assertEqual(generated, again)
+        expected = 0xcbf29ce484222325
+        for byte in source.encode("utf-8"):
+            expected ^= byte
+            expected = (expected * 0x100000001b3) & 0xffffffffffffffff
+        self.assertIn(f"sluguiSourceFingerprint = 0x{expected:016x}ULL", generated)
+        self.assertNotEqual(generated.split("sluguiSourceFingerprint")[1][:35],
+                            updated.split("sluguiSourceFingerprint")[1][:35])
+
     def test_atomic_output_preserves_unchanged_timestamp(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "generated.hpp"
@@ -80,6 +95,170 @@ component PaintSample {
         self.assertIn("GradientKind::Radial", generated)
         self.assertIn("CornerRadii{4.0f, 8.0f, 12.0f, 16.0f}", generated)
         self.assertIn("CornerSmoothing{0.0f, 25.0f, 50.0f, 100.0f}", generated)
+
+    def test_multistop_linear_gradient_preserves_intermediate_colors(self):
+        source = """
+component HueSlider {
+  Rectangle root {
+    fill: linear-stops([
+      stop(0, #ff0000),
+      stop(0.25, #ffff00),
+      stop(0.5, #00ff00),
+      stop(0.75, #0000ff),
+      stop(1, #ff0000)
+    ], 0, 0, 0, 1);
+  }
+}
+"""
+        generated = compiler.compile_text(source, "hue.slugui", "test")
+        self.assertIn("Paint::linearStops", generated)
+        self.assertIn("0.25f", generated)
+        self.assertIn("0.75f", generated)
+        self.assertIn("Color::fromRgb8(0x00ff00)", generated)
+
+    def test_figma_nonlinear_stop_tables_compile_with_exact_matrix(self):
+        source = """
+component FigmaPaint {
+  Absolute root {
+    Rectangle ring {
+      width: 96px;
+      height: 96px;
+      fill: angular-stops([stop(0, #ff0000),
+                           stop(0.5, #00ff00cc),
+                           stop(1, #ff0000)],
+                          1, 0.25, 0.125, -0.5, 1, 0.75);
+    }
+    Rectangle radial {
+      fill: radial-stops([stop(0, #ffffff),stop(1, #000000)],
+                         1, 0, 0, 0, 1, 0);
+    }
+    Rectangle diamond {
+      fill: diamond-stops([stop(0, #ffffff),stop(1, #000000)],
+                          1, 0, 0, 0, 1, 0);
+    }
+  }
+}
+"""
+        generated = compiler.compile_text(source, "nonlinear.slugui", "test")
+        for kind in ("AngularStops", "RadialStops", "DiamondStops"):
+            self.assertIn("slugia::GradientKind::" + kind, generated)
+        self.assertIn("0.25f", generated)
+        self.assertIn("-0.5f", generated)
+        self.assertIn("0x00ff00", generated)
+
+    def test_figma_0938px_outside_stroke_legacy_placement(self):
+        # Historical v5 mirrored Figma HANDLE omitted stroke-placement,
+        # despite a 26.875px outline around its 25px original circle.
+        source = """
+component Cursor {
+  Absolute root {
+    Shape handle {
+      width: 25px;
+      height: 25px;
+      path-data: "M0 0 L25 0 L25 25 L0 25 Z";
+      stroke-path-data: "M0 0 L26.875 0 L26.875 26.875 L0 26.875 Z";
+      fill: #ffffff;
+      stroke: #00000066;
+      stroke-width: 0.938;
+      stroke-align: outside;
+      transform: [-1, 0, 0, 1];
+      source-provider: "figma";
+    }
+  }
+}
+"""
+        expected = ("strokePlacement = "
+                    "slugia::Rect{-0.0375f, -0.0375f, 1.075f, 1.075f}")
+        generated = compiler.compile_text(source, "old-handle.slugui", "test")
+        self.assertIn(expected, generated)
+        # Buggy exporters also emitted [0,0,expanded-width,expanded-height].
+        incorrect = source.replace("stroke-align: outside;",
+            "stroke-align: outside;\n      "
+            "stroke-placement: [0px, 0px, 26.875px, 26.875px];")
+        self.assertIn(expected, compiler.compile_text(
+            incorrect, "old-explicit-handle.slugui", "test"))
+        # An authored offset is NOT an old viewport bug; preserve it.
+        authored = source.replace("stroke-align: outside;",
+            "stroke-align: outside;\n      "
+            "stroke-placement: [-0.5px, -0.5px, 26.875px, 26.875px];")
+        self.assertIn("strokePlacement = slugia::Rect{-0.02f, -0.02f",
+                      compiler.compile_text(authored, "authored-handle.slugui", "test"))
+
+    def test_nested_affine_matrix_compiles_into_local_basis(self):
+        source = """
+component NestedAffine {
+  Absolute root {
+    Rectangle frame {
+      x: 80px;
+      y: 0px;
+      width: 100px;
+      height: 80px;
+      transform: [0, 1, -1, 0];
+      Rectangle child {
+        x: 70px;
+        y: 10px;
+        width: 20px;
+        height: 30px;
+        transform: [0, -1, 1, 0];
+      }
+    }
+  }
+}
+"""
+        generated = compiler.compile_text(source, "affine.slugui", "test")
+        self.assertIn("localTransform = {0.0f, 1.0f, -1.0f, 0.0f}", generated)
+        self.assertIn("localTransform = {0.0f, -1.0f, 1.0f, 0.0f}", generated)
+        self.assertIn("layout.x = slugia::slugui::Length::logical(70.0f)", generated)
+
+    def test_reject_singular_affine(self):
+        source = """
+component Invalid {
+  Rectangle root { transform: [1, 2, 2, 4]; }
+}
+"""
+        with self.assertRaisesRegex(compiler.CompileError, "singular"):
+            compiler.compile_text(source, "singular.slugui", "test")
+
+    def test_rectangle_fill_layers_emit_all_paints_in_order(self):
+        source = """
+component SaturationSquare {
+  Rectangle frame {
+    width: 96px;
+    height: 96px;
+    clip: true;
+    fill: #00000000;
+    fill-layers: [
+      #ffffff,
+      linear(#ffffff, #ff0000, 0, 0, 1, 0),
+      linear-stops([stop(0, #00000000), stop(0.5, #00000080),
+                    stop(1, #000000)], 0, 0, 0, 1)
+    ];
+    stroke: #ffffff80;
+    stroke-width: 2;
+    stroke-align: center;
+  }
+}
+"""
+        generated = compiler.compile_text(source, "square.slugui", "test")
+        self.assertEqual(generated.count("fillLayers.emplace_back()"), 3)
+        self.assertIn("fillLayers.back().normal = slugia::Paint::solid", generated)
+        self.assertIn("fillLayers.back().normal = slugia::Paint::gradient", generated)
+        self.assertIn("fillLayers.back().normal = slugia::Paint::linearStops", generated)
+        self.assertTrue(generated.index("fillLayers.back().normal = slugia::Paint::solid") <
+                        generated.index("fillLayers.back().normal = slugia::Paint::gradient") <
+                        generated.index("fillLayers.back().normal = slugia::Paint::linearStops"))
+        self.assertIn("stroke.align = slugia::StrokeAlign::Center", generated)
+
+    def test_multistop_gradient_rejects_unsorted_values(self):
+        source = """
+component InvalidHue {
+  Rectangle root {
+    fill: linear-stops([stop(0.5, #ff0000), stop(0.2, #0000ff)]);
+  }
+}
+"""
+        with self.assertRaisesRegex(compiler.CompileError, "nondecreasing"):
+            compiler.compile_text(source, "bad-hue.slugui", "test")
 
     def test_unicode_is_emitted_as_utf8_bytes(self):
         source = """

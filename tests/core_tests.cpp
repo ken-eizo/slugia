@@ -394,6 +394,55 @@ int main() try {
               cubic.to.x == 220 && std::abs(cubic.style.width - 3.25f) < 0.0001f,
           "cubic command preserves authored control points and width");
 
+  // A clipped atlas shape plus a full-bleed transparent paint must compose
+  // in painter order before applying their common parent AA once.
+  {
+    DrawList group;
+    const Rect frame{120.375f,90.25f,89.0f,75.0f};
+    const auto white=Paint::solid(Color::fromRgb8(0xffffff));
+    const auto checker=Paint::solid(Color::fromRgb8(0xd5d5d5));
+    const auto red=Paint::solid(Color::fromRgb8(0xff0000,0.5f));
+    auto clip=std::make_shared<std::vector<RoundedClip>>();
+    clip->push_back({frame,CornerRadii::all(11.0f),{},{1,0,0,0,1,0}});
+    group.roundedRect(frame,11.0f,white);
+    group.setRoundedClips(clip);
+    group.setClip({frame.x-1,frame.y-1,frame.width+2,frame.height+2});
+    group.shape(117,{frame.x-5,frame.y-5,frame.width+10,frame.height+10},checker);
+    group.roundedRect(frame,0,red);
+    require(group.commands().size()==1,
+      "exact clipped Frame children can share one vector contour AA draw");
+    const auto& merged=std::get<RoundedRectCommand>(group.commands().front());
+    require(merged.compositeLayers && merged.compositeLayers->size()==3 &&
+      merged.compositeLayers->at(0).shape==0 &&
+      merged.compositeLayers->at(1).shape==117 &&
+      merged.compositeLayers->at(2).shape==0,
+      "merged masked vector layers preserve the original paint order");
+    DrawList narrower;
+    narrower.roundedRect(frame,11.0f,white);
+    narrower.setRoundedClips(clip);
+    narrower.setClip({frame.x+5,frame.y+5,frame.width-10,frame.height-10});
+    narrower.shape(117,frame,checker);
+    require(narrower.commands().size()==2,
+      "partial child clip must never be fused into the parent's full mask");
+    DrawList multilayer;
+    multilayer.roundedRect(frame,11.0f,white);
+    multilayer.setRoundedClips(clip);
+    multilayer.setClip({frame.x-1,frame.y-1,frame.width+2,frame.height+2});
+    multilayer.shape(117,frame,checker);
+    multilayer.roundedRectLayers(frame,CornerRadii{}, {red,checker});
+    require(multilayer.commands().size()==1 &&
+      std::get<RoundedRectCommand>(multilayer.commands()[0]).compositeLayers &&
+      std::get<RoundedRectCommand>(multilayer.commands()[0]).compositeLayers->size()==4,
+      "child full-bleed paint stack must preserve all layers without overwriting clipped shape");
+    DrawList outside;
+    outside.roundedRect(frame,11.0f,white);
+    outside.setRoundedClips(clip);
+    outside.setClip({frame.x-1,frame.y-1,frame.width+2,frame.height+2});
+    outside.shape(117,{frame.x+300,frame.y,20,20},checker);
+    require(outside.commands().size()==2,
+      "completely off-frame atlas children cannot be fused into the group");
+  }
+
   VectorAtlas atlas;
   const auto lowSpec = RendererConfig::lowSpec();
   require(lowSpec.vsync && !lowSpec.enableContinuousCorners &&
@@ -413,6 +462,20 @@ int main() try {
               performanceLow.persistentGeometryBufferBytes == lowSpec.persistentGeometryBufferBytes &&
               performanceLow.dynamicPathCacheBytes == lowSpec.dynamicPathCacheBytes,
           "performance preset selects the verified layout within existing resource budgets");
+  const auto efficientUi = RendererConfig::interactiveUi();
+  const auto efficientLow = RendererConfig::interactiveUi(true);
+  require(efficientUi.vsync && !efficientUi.allowTearing &&
+              efficientUi.enableContinuousCorners &&
+              efficientUi.enableAtlasStoragePaths &&
+              efficientUi.enablePackedAtlasBands &&
+              efficientUi.persistentGeometryBufferBytes == (2U << 20U) &&
+              efficientUi.dynamicPathCacheBytes == (2U << 20U) &&
+              efficientUi.dynamicGeometryCacheBytes == (1U << 20U) &&
+              efficientUi.glyphRunCacheCapacity == 256 &&
+              efficientUi.initialVertexCapacity == (1U << 10U) &&
+              efficientLow.persistentGeometryBufferBytes ==
+                lowSpec.persistentGeometryBufferBytes,
+          "interactiveUi cuts bounded resource budgets without disabling contour accuracy");
   require(&logicalDevice.atlas() == &atlas, "RenderDevice preserves atlas identity");
   static_assert(std::is_move_constructible_v<RenderSurface>);
 #if defined(_WIN32)
@@ -762,6 +825,122 @@ int main() try {
             std::get<RoundedRectCommand>(list.commands()[0]).destination.x == 20.0f &&
             std::get<RoundedRectCommand>(list.commands()[1]).destination.x == 0.0f,
             "Figma itemReverseZIndex reverses canvas stacking without reversing layout");
+  }
+
+  {
+    namespace sui = slugui;
+    // Figma Frame clip contents: the parent paints unmasked, but its descendants
+    // receive the rounded mask; hit testing rejects visually clipped corners.
+    auto frame = sui::roundedRectangle(
+      hashId("rounded-frame"), Paint::solid(Color::fromRgb8(0x202020)),
+      CornerRadii::all(20.0f));
+    frame.layout.width = sui::Length::physical(100.0f);
+    frame.layout.height = sui::Length::physical(100.0f);
+    frame.clipsChildren = true;
+    auto child = sui::roundedRectangle(
+      hashId("clipped-child"), Paint::solid(Color::fromRgb8(0xff0000)));
+    child.layout.width = sui::Length::physical(100.0f);
+    child.layout.height = sui::Length::physical(100.0f);
+    child.interaction = {true, true, 7};
+    frame.add(std::move(child));
+    sui::Component component(std::move(frame));
+    sui::Runtime runtime;
+    DrawList list;
+    runtime.render(component, sui::FrameInput{}, list, {0, 0, 100, 100});
+    require(list.commands().size() == 2,
+            "rounded Frame and its child must both emit draw commands");
+    const auto& parent = std::get<RoundedRectCommand>(list.commands()[0]);
+    const auto& clippedChild = std::get<RoundedRectCommand>(list.commands()[1]);
+    require(!parent.roundedClips && clippedChild.roundedClips &&
+            clippedChild.roundedClips->size() == 1 &&
+            clippedChild.roundedClips->front().radii.topLeft == 20.0f,
+            "rounded Clip Content is inherited by the child only");
+    require(runtime.hitTest({1, 1}) == sui::RuntimeNodeId{} &&
+            runtime.hitTest({50, 50}).element == hashId("clipped-child"),
+            "hit-testing respects ancestor rounded clipping");
+  }
+
+  {
+    namespace sui = slugui;
+    // Layered Figma paints keep every gradient. Frame clipping does not hide
+    // the INNER half of the centered frame stroke beneath children.
+    auto frame = sui::roundedRectangle(
+      hashId("layered-stroked-frame"), Paint::solid(Color{}, 0),
+      CornerRadii::all(12.0f));
+    frame.layout.width = sui::Length::physical(96.0f);
+    frame.layout.height = sui::Length::physical(96.0f);
+    frame.clipsChildren = true;
+    auto& visual = std::get<sui::RoundedRectangleVisual>(frame.visual);
+    visual.fillLayers.push_back({Paint::solid(Color::fromRgb8(0xffffff))});
+    visual.fillLayers.push_back({Paint::gradient(GradientKind::Linear,
+      Color::fromRgb8(0xffffff, 0), Color::fromRgb8(0xff0000), {0,0}, {1,0})});
+    visual.stroke.width = 8.0f;
+    visual.stroke.align = StrokeAlign::Center;
+    visual.stroke.paint.normal = Paint::solid(Color::fromRgb8(0x0000ff));
+    auto child = sui::roundedRectangle(
+      hashId("stroke-overlap-child"), Paint::solid(Color::fromRgb8(0x00ff00)));
+    child.layout.width = sui::Length::physical(96.0f);
+    child.layout.height = sui::Length::physical(96.0f);
+    frame.add(std::move(child));
+    sui::Component component(std::move(frame));
+    sui::Runtime runtime;
+    DrawList list;
+    runtime.render(component, sui::FrameInput{}, list, {0, 0, 96, 96});
+    // A Figma solid/linear stack now draws ONCE under a common AA mask:
+    // stack -> clipped child -> delayed frame stroke, not two separate fills.
+    require(list.commands().size() == 3,
+            "two Figma fill layers must share one AA command, followed by child and border");
+    const auto& mergedFills = std::get<RoundedRectCommand>(list.commands()[0]);
+    const auto& childCommand = std::get<RoundedRectCommand>(list.commands()[1]);
+    const auto& borderCommand = std::get<RoundedRectCommand>(list.commands()[2]);
+    require(mergedFills.fillLayers && mergedFills.fillLayers->size() == 2 &&
+            mergedFills.fillLayers->at(0).kind == GradientKind::Solid &&
+            mergedFills.fillLayers->at(1).kind == GradientKind::Linear &&
+            childCommand.roundedClips && borderCommand.border.align == StrokeAlign::Center &&
+            borderCommand.border.width == 8.0f &&
+            borderCommand.paint.opacity == 0.0f &&
+            !borderCommand.roundedClips,
+            "paint stack preserves layer order and frame stroke stays above children");
+  }
+
+  {
+    namespace sui = slugui;
+    // Figma relativeTransform is a LOCAL basis. A nested child inherits
+    // the parent's rotation, without subtracting rotated page AABBs.
+    auto root = sui::absolute(hashId("affine-root"));
+    auto frame = sui::absolute(hashId("affine-parent"));
+    frame.layout.x = sui::Length::physical(100);
+    frame.layout.y = sui::Length::physical(50);
+    frame.layout.width = sui::Length::physical(100);
+    frame.layout.height = sui::Length::physical(80);
+    frame.localTransform = {0, 1, -1, 0};
+    auto child = sui::roundedRectangle(hashId("affine-child"),
+        Paint::solid(Color::fromRgb8(0xff0000)));
+    child.layout.x = sui::Length::physical(20);
+    child.layout.y = sui::Length::physical(10);
+    child.layout.width = sui::Length::physical(30);
+    child.layout.height = sui::Length::physical(12);
+    child.interaction = {true, true, 14};
+    frame.add(std::move(child));
+    root.add(std::move(frame));
+    sui::Component component(std::move(root));
+    sui::Runtime runtime;
+    DrawList draw;
+    runtime.render(component, sui::FrameInput{}, draw, {0, 0, 256, 256});
+    require(draw.commands().size() == 1 &&
+      std::holds_alternative<ProjectedDrawListCommand>(draw.commands().front()),
+      "rotated child must use native projected GPU path");
+    const auto& projected = std::get<ProjectedDrawListCommand>(draw.commands().front());
+    const auto& m = projected.transform.matrix;
+    require(std::abs(m[0]) < 0.0001f && m[1] == -1.0f && m[2] == 150.0f &&
+            m[3] == 1.0f && std::abs(m[4]) < 0.0001f && m[5] == -50.0f,
+            "parent rotation must correctly compose with child local position");
+    require(projected.content && projected.content->commands().size() == 1,
+            "rotated object geometry must remain intact inside projected batch");
+    require(runtime.hitTest({84,85}).element == hashId("affine-child"),
+            "rotated hit testing must accept the transformed visible area");
+    require(runtime.hitTest({135,65}) == sui::RuntimeNodeId{},
+            "rotated hit testing must reject the old unrotated rectangle");
   }
 
   {

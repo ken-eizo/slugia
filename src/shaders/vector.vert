@@ -10,6 +10,7 @@ layout(location = 6) in vec4 inPaint;
 layout(location = 7) in vec4 inGradient;
 layout(location = 8) in vec4 inClip;
 layout(location = 9) in vec4 inStrokeWidths;
+layout(location = 10) in uint inRoundedClipRef;
 
 layout(push_constant) uniform PushConstants {
   vec4 viewportScale;
@@ -31,6 +32,7 @@ layout(location = 7) flat out vec4 gradientData;
 layout(location = 8) flat out vec4 clipRect;
 layout(location = 9) flat out vec4 strokeWidths;
 layout(location = 10) out vec2 localPosition;
+layout(location = 11) flat out uint roundedClipRef;
 
 void main() {
   const uint dynamicSlugShape = 0xFFFFFFF8u;
@@ -141,4 +143,5 @@ void main() {
   gradientData = inGradient;
   clipRect = pushConstants.translationOverride.z > 0.5 ? pushConstants.overrideClip : inClip;
   strokeWidths = inStrokeWidths;
+  roundedClipRef = inRoundedClipRef;
 }

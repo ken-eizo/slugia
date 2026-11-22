@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import math
 import os
@@ -562,6 +563,46 @@ def paint_cpp(value: Value) -> str:
         if len(args) == 2:
             result += f", {scalar_from_value(args[1])}"
         return result + ")"
+    if name in ("linear-stops", "angular-stops", "radial-stops", "diamond-stops"):
+        if name != "linear-stops":
+            if len(args) != 7:
+                raise CompileError(
+                    f"{name} expects [stop(position, color), ...], a, b, c, d, e, f",
+                    value.token)
+        elif len(args) not in (1, 5):
+            raise CompileError(
+                "linear-stops([stop(position, color), ...][, ox, oy, tx, ty]) expects 1 or 5 arguments",
+                value.token)
+        if args[0].kind != "list" or not 2 <= len(args[0].arguments) <= 256:
+            raise CompileError("linear-stops requires a list of 2..256 stops", args[0].token)
+        entries = []
+        previous = -float("inf")
+        for item in args[0].arguments:
+            if item.kind != "call" or item.value != "stop" or len(item.arguments) != 2:
+                raise CompileError("expected stop(position, color)", item.token)
+            position = item.arguments[0]
+            if position.kind != "number":
+                raise CompileError("stop position must be a number", position.token)
+            n = float(position.value)
+            if not math.isfinite(n) or n < previous:
+                raise CompileError("stop positions must be finite and nondecreasing", position.token)
+            previous = n
+            entries.append("{" + scalar_from_value(position) + ", " +
+                           color_cpp(item.arguments[1]) + "}")
+        if name != "linear-stops":
+            kind = {"angular-stops": "AngularStops",
+                    "radial-stops": "RadialStops",
+                    "diamond-stops": "DiamondStops"}[name]
+            matrix = ", ".join(scalar_from_value(v) for v in args[1:])
+            return (f"slugia::Paint::figmaStops(slugia::GradientKind::{kind}, "
+                    + "{" + ", ".join(entries) + "}, {" + matrix + "})")
+        result = "slugia::Paint::linearStops({" + ", ".join(entries) + "}"
+        if len(args) == 5:
+            result += (
+                f", {{{scalar_from_value(args[1])}, {scalar_from_value(args[2])}}}, "
+                f"{{{scalar_from_value(args[3])}, {scalar_from_value(args[4])}}}"
+            )
+        return result + ")"
     kinds = {
         "linear": "Linear",
         "diamond": "Diamond",
@@ -949,14 +990,36 @@ class Generator:
             return None
         return origin_x, origin_y, width, height
 
-    def _path_placement(self, element: ElementDecl, bounds: Bounds) -> str | None:
+    def _path_placement(self, element: ElementDecl, bounds: Bounds,
+                        stroke: bool = False) -> str | None:
         width = self._authored_extent(element, "width")
         height = self._authored_extent(element, "height")
         if width is None or height is None:
             return None
+        origin_x, origin_y = bounds.minimum_x, bounds.minimum_y
+        if stroke and self._is_figma_element(element):
+            # Figma's outlineStroke() normalizes the new stroked path's SVG
+            # viewport to (0,0). Rotated/mirrored Shape nodes from exporter v5
+            # omitted stroke-placement, so AOT assumed that viewport matched
+            # the original fill. Recover the source contour offset from the
+            # exact SVG bounds: 25px circle + 0.938px OUTSIDE stroke has SVG
+            # bounds [0,0,26.875,26.875], but belongs at [-0.9375,-0.9375].
+            alignment = next((item.value for item in element.attributes
+                              if item.name == "stroke-align"), None)
+            thickness = self._fixed_scalar(element, "stroke-width")
+            if (alignment is not None and str(alignment.value).lower() == "outside"
+                    and thickness is not None and thickness > 0):
+                delta_x = (bounds.width - width) * 0.5
+                delta_y = (bounds.height - height) * 0.5
+                if (delta_x > 0 and delta_y > 0 and
+                    abs(delta_x - thickness) <= 0.025 and
+                    abs(delta_y - thickness) <= 0.025 and
+                    abs(origin_x) <= 0.001 and abs(origin_y) <= 0.001):
+                    origin_x = -delta_x
+                    origin_y = -delta_y
         values = (
-            bounds.minimum_x / width,
-            bounds.minimum_y / height,
+            origin_x / width,
+            origin_y / height,
             bounds.width / width,
             bounds.height / height,
         )
@@ -983,6 +1046,28 @@ class Generator:
         if width <= 0.0 or height <= 0.0:
             raise CompileError(f"{attribute.name} requires positive fixed width and height",
                                attribute.token)
+        # Compatibility for Figma exporter v5: outlineStroke() returns an
+        # independent outlined shape with local SVG origin (0,0). Some older
+        # exports stored its larger render size but failed to place its origin
+        # outside the authored shape. A 25px circle with 0.938px OUTSIDE
+        # stroke became [0,0,26.875,26.875] instead of
+        # [-0.9375,-0.9375,26.875,26.875]. Correct only this identifiable
+        # buggy Figma case; leave genuine authored SVG placements untouched.
+        if (attribute.name == "stroke-placement" and self._is_figma_element(element)
+                and recovered_owner is None):
+            alignment = next((item.value for item in element.attributes
+                              if item.name == "stroke-align"), None)
+            thickness = self._fixed_scalar(element, "stroke-width")
+            if (alignment is not None and str(alignment.value).lower() == "outside"
+                    and thickness is not None and thickness > 0):
+                expansion_x = (parsed[2] - width) * 0.5
+                expansion_y = (parsed[3] - height) * 0.5
+                if (0 < expansion_x and 0 < expansion_y and
+                    abs(expansion_x - thickness) <= 0.025 and
+                    abs(expansion_y - thickness) <= 0.025 and
+                    abs(parsed[0]) <= 0.001 and abs(parsed[1]) <= 0.001):
+                    parsed[0] = -expansion_x
+                    parsed[1] = -expansion_y
         disjoint = (parsed[0] + parsed[2] < 0 or parsed[0] > width or
                     parsed[1] + parsed[3] < 0 or parsed[1] > height)
         if (self._is_figma_element(element) and recovered_owner is None and
@@ -1024,6 +1109,24 @@ class Generator:
             }, "layout")
             self._line(lines, indent,
                        f"{variable}.layout.kind = slugia::slugui::LayoutKind::{enum_value};")
+            return True
+        if name == "transform":
+            values = value.arguments if value.kind == "list" else []
+            if len(values) != 4:
+                raise CompileError("transform expects [a, b, c, d]", attribute.token)
+            numbers = []
+            for item in values:
+                if item.kind != "number":
+                    raise CompileError("transform components must be unitless numbers", item.token)
+                v = float(item.value)
+                if not math.isfinite(v):
+                    raise CompileError("transform components must be finite", item.token)
+                numbers.append(v)
+            determinant = numbers[0] * numbers[3] - numbers[1] * numbers[2]
+            if abs(determinant) < 1e-8:
+                raise CompileError("transform cannot be singular", attribute.token)
+            self._line(lines, indent, f"{variable}.localTransform = {{" +
+                       ", ".join(cpp_float(f'{n:.9g}') for n in numbers) + "};")
             return True
         if name == "position":
             positioned = self._enum(value, {
@@ -1207,6 +1310,17 @@ class Generator:
                     lines, indent,
                     f"{visual}.paint.{state} = slugia::slugui::ValueSource<slugia::Paint>{{{resolved}}};",
                 )
+            return True
+        if name == "fill-layers":
+            if element.kind != "Rectangle":
+                raise CompileError("fill-layers requires Rectangle", attribute.token)
+            if value.kind != "list" or not 2 <= len(value.arguments) <= 64:
+                raise CompileError("fill-layers requires 2..64 paints", attribute.token)
+            for layer in value.arguments:
+                resolved = self._value(layer, "paint")
+                self._line(lines, indent, f"{visual}.fillLayers.emplace_back();")
+                self._line(lines, indent,
+                           f"{visual}.fillLayers.back().normal = {resolved};")
             return True
         if name in ("stroke", "stroke-hovered", "stroke-pressed", "stroke-disabled"):
             if element.kind not in ("Rectangle", "Shape"):
@@ -1513,7 +1627,7 @@ class Generator:
             )
             placement = self._explicit_path_placement(element, stroke_placement_attribute)
             if placement is None:
-                placement = self._path_placement(element, stroke_bounds)
+                placement = self._path_placement(element, stroke_bounds, stroke=True)
             if placement is not None:
                 self._line(lines, indent, f"{shape_visual}.strokePlacement = {placement};")
         for attribute in element.attributes:
@@ -1697,7 +1811,7 @@ class Generator:
         walk(self.component.root)
         return requests
 
-    def generate(self, source_name: str) -> str:
+    def generate(self, source_name: str, source_fingerprint: int = 0) -> str:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.component.name):
             raise CompileError("component name must be a C++ identifier", self.component.token)
         namespace_parts = self.namespace.split("::") if self.namespace else []
@@ -1771,6 +1885,10 @@ class Generator:
         lines.extend([
             f"struct {class_name} {{",
             "public:",
+            # Runtime compares the AOT-compiled input to the active .slugui file.
+            # Reopening a previously copied EXE must not claim fresh fidelity.
+            f"  static constexpr std::uint64_t sluguiSourceFingerprint = "
+            f"0x{source_fingerprint:016x}ULL;",
         ])
         for callback, member in sorted(self.callbacks.items()):
             lines.append(
@@ -1870,9 +1988,13 @@ def compile_text(source: str, source_name: str, namespace: str,
     component = parse_source(source)
     header = re.search(r"(?m)^\s*//\s*SlugUI exchange format\s+(\d+)\s*,", source)
     legacy_figma_coordinates = header is not None and int(header.group(1)) == 1
+    fingerprint = 0xcbf29ce484222325  # FNV-1a, normalized UTF-8 source
+    for byte in source.encode("utf-8"):
+        fingerprint ^= byte
+        fingerprint = (fingerprint * 0x100000001b3) & 0xffffffffffffffff
     return Generator(
         component, namespace, class_name, legacy_figma_coordinates,
-        strip_source_metadata).generate(source_name)
+        strip_source_metadata).generate(source_name, fingerprint)
 
 
 def write_atomic(path: Path, content: str) -> bool:

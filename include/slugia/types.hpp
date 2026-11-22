@@ -4,7 +4,12 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
+#include <memory>
+#include <limits>
 #include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -112,7 +117,22 @@ using RetainedDrawListId = std::uint32_t;
 using ExternalImageId = std::uint32_t;
 using WidgetId = std::uint64_t;
 
-enum class GradientKind : std::uint32_t { Solid, Linear, Diamond, Radial, Shader, HsvConic };
+enum class GradientKind : std::uint32_t {
+  Solid, Linear, Diamond, Radial, Shader, HsvConic, LinearStops,
+  AngularStops, RadialStops, DiamondStops
+};
+
+constexpr bool hasGradientStopTable(GradientKind kind) noexcept {
+  return kind == GradientKind::LinearStops || kind == GradientKind::AngularStops ||
+         kind == GradientKind::RadialStops || kind == GradientKind::DiamondStops;
+}
+
+// Explicit immutable stop table, stored once per authored gradient and shared by
+// cheap Paint copies. The ordinary solid / 2-color gradient path stays allocation-free.
+struct GradientStop {
+  float position = 0.0f;
+  Color color{};
+};
 
 struct Paint {
   GradientKind kind = GradientKind::Solid;
@@ -122,6 +142,61 @@ struct Paint {
   Vec2 target = {1.0f, 1.0f};
   float opacity = 1.0f;
   float shaderParameter = 0.0f;
+  std::shared_ptr<const std::vector<GradientStop>> stops{};
+  // Figma's shape-normalized coordinates -> gradient-space 2x3 affine.
+  // Only stop-table gradient kinds need this extra 24-byte field.
+  std::array<float,6> gradientTransform{1, 0, 0, 0, 1, 0};
+
+  static Paint linearStops(std::span<const GradientStop> values,
+                           Vec2 origin = {0.0f, 0.0f}, Vec2 target = {1.0f, 0.0f},
+                           float opacity = 1.0f) {
+    if (values.size() < 2 || values.size() > 256)
+      throw std::invalid_argument("linearStops requires 2..256 color stops");
+    float prior = -std::numeric_limits<float>::infinity();
+    for (const auto& stop : values) {
+      if (!std::isfinite(stop.position) || stop.position < prior ||
+          !std::isfinite(stop.color.r) || !std::isfinite(stop.color.g) ||
+          !std::isfinite(stop.color.b) || !std::isfinite(stop.color.a))
+        throw std::invalid_argument("Gradient stops must have finite sorted positions/colors");
+      prior = stop.position;
+    }
+    Paint result = gradient(GradientKind::LinearStops, values.front().color,
+                            values.back().color, origin, target, opacity);
+    result.stops = std::make_shared<const std::vector<GradientStop>>(
+      values.begin(), values.end());
+    return result;
+  }
+
+  static Paint linearStops(std::initializer_list<GradientStop> values,
+                           Vec2 origin = {0.0f, 0.0f}, Vec2 target = {1.0f, 0.0f},
+                           float opacity = 1.0f) {
+    return linearStops(std::span<const GradientStop>(values.begin(), values.size()),
+                       origin, target, opacity);
+  }
+
+  static Paint figmaStops(GradientKind kind,
+                          std::span<const GradientStop> values,
+                          std::array<float,6> transform = {1,0,0, 0,1,0},
+                          float opacity = 1.0f) {
+    if (kind != GradientKind::AngularStops &&
+        kind != GradientKind::RadialStops &&
+        kind != GradientKind::DiamondStops)
+      throw std::invalid_argument("figmaStops expects angular/radial/diamond kind");
+    for (const auto value : transform)
+      if (!std::isfinite(value))
+        throw std::invalid_argument("Gradient transform must be finite");
+    Paint result = linearStops(values, {}, {1,0}, opacity);
+    result.kind = kind;
+    result.gradientTransform = transform;
+    return result;
+  }
+  static Paint figmaStops(GradientKind kind,
+                          std::initializer_list<GradientStop> values,
+                          std::array<float,6> transform = {1,0,0, 0,1,0},
+                          float opacity = 1.0f) {
+    return figmaStops(kind, std::span<const GradientStop>(values.begin(), values.size()),
+                      transform, opacity);
+  }
 
   static Paint solid(Color color, float opacity = 1.0f) {
     Paint result;
@@ -228,6 +303,21 @@ struct CornerSmoothing {
 
   static constexpr CornerSmoothing all(float percent) { return {percent, percent, percent, percent}; }
 };
+
+// Ancestor clips are evaluated in their own authored coordinates. The inverse
+// world affine lets a rotated child respect a differently rotated parent mask.
+struct RoundedClip {
+  Rect bounds{};
+  CornerRadii radii{};
+  CornerSmoothing smoothing{};
+  // Row-major 2x3 inverse world transform.
+  std::array<float,6> inverseWorld{1,0,0, 0,1,0};
+  // False (default): authored Frame Clip contents has a WORLD-space mask
+  // shared by transformed descendants. True: a manually projected DrawList
+  // owns its local mask and the mask transforms WITH that projected content.
+  bool projectiveLocal = false;
+};
+using RoundedClipChain = std::shared_ptr<const std::vector<RoundedClip>>;
 
 enum class HorizontalAlign : std::uint8_t { Left, Center, Right, Justify };
 enum class VerticalAlign : std::uint8_t { Top, Center, Bottom };

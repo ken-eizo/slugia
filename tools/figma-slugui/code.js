@@ -1,6 +1,7 @@
 "use strict";
 
 const FORMAT_VERSION = 3;
+const EXPORTER_REVISION = "2026-11-22-stroke-v6";
 const INLINE_SOURCE_LIMIT = 200000;
 const diagnostics = [];
 const fidelityCounts = { native: 0, approximated: 0, bakedVector: 0, unsupported: 0 };
@@ -8,6 +9,9 @@ const vectorGeometryCache = new Map();
 const styledTextCache = new Map();
 const mainComponentCache = new Map();
 const imageInfoCache = new Map();
+// Async Figma library/style data is resolved before the synchronous AOT source pass.
+const designVariableCache = new Map();
+const designStyleCache = new Map();
 const indentCache = [""];
 let targetedNodeChangeEvents = false;
 let exportContext = null;
@@ -26,6 +30,10 @@ function createExportContext() {
     dependencyIds: new Set(),
     dependencyRoots: new WeakSet(),
     nodeCount: 0,
+    gradientPaintCount: 0,
+    multistopGradientCount: 0,
+    flatGradientCount: 0,
+    mirroredNodeCount: 0,
     vectorCacheHits: 0,
     textCacheHits: 0,
     temporaryMutation: false,
@@ -207,6 +215,13 @@ function number(value) {
   return String(Object.is(rounded, -0) ? 0 : rounded);
 }
 
+// Matrix coefficients multiply canvas dimensions. Three decimal places
+// can accumulate a pixel of drift in larger components.
+function matrixNumber(value) {
+  const rounded = Math.round(finite(value, 0) * 1000000) / 1000000;
+  return String(Object.is(rounded, -0) ? 0 : rounded);
+}
+
 function slugString(value) {
   return JSON.stringify(String(value));
 }
@@ -270,16 +285,89 @@ function colorHex(color, opacity) {
   return alpha >= 0.9995 ? rgb : rgb + hexByte(alpha);
 }
 
+function variableAlias(value) {
+  return value && typeof value === "object" &&
+    value.type === "VARIABLE_ALIAS" && typeof value.id === "string" && value.id
+    ? value : null;
+}
+
+function resolvedVariable(alias, node, type) {
+  alias = variableAlias(alias);
+  if (!alias) return null;
+  const variable = designVariableCache.get(alias.id);
+  if (!variable || typeof variable.resolveForConsumer !== "function") return null;
+  try {
+    const result = variable.resolveForConsumer(node);
+    return result && result.resolvedType === type ? result.value : null;
+  } catch (_) { return null; }
+}
+
+function resolvedNodeNumber(node, field, fallback) {
+  const bindings = safeNodeValue(node, "boundVariables", null);
+  const resolved = resolvedVariable(bindings && bindings[field], node, "FLOAT");
+  return finite(resolved, finite(safeNodeValue(node, field, null), fallback));
+}
+
+function resolvedPaint(node, paint, alias) {
+  const bindings = paint.boundVariables || {};
+  const originalColor = paint.color;
+  const color = resolvedVariable(bindings.color || alias, node, "COLOR");
+  const opacity = resolvedVariable(bindings.opacity, node, "FLOAT");
+  const result = { ...paint };
+  if (color && typeof color === "object" && ["r", "g", "b"].every(
+    (key) => typeof color[key] === "number" && Number.isFinite(color[key]))) {
+    result.color = { ...originalColor, ...color };
+  }
+  if (typeof opacity === "number" && Number.isFinite(opacity))
+    result.opacity = opacity;
+  if (Array.isArray(paint.gradientStops)) {
+    result.gradientStops = paint.gradientStops.map((stop) => {
+      const resolved = resolvedVariable(stop.boundVariables && stop.boundVariables.color, node, "COLOR");
+      return resolved && typeof resolved === "object" &&
+        ["r", "g", "b"].every((key) => Number.isFinite(resolved[key]))
+        ? { ...stop, color: { ...stop.color, ...resolved } } : stop;
+    });
+  }
+  return result;
+}
+
+function resolvedPaintList(node, paints, role) {
+  const bound = safeNodeValue(node, "boundVariables", null);
+  const aliases = bound && Array.isArray(bound[role]) ? bound[role] : [];
+  return paints.map((paint, index) => paint ? resolvedPaint(node, paint, aliases[index]) : null)
+    .filter((paint) => paint && paint.visible !== false);
+}
+
+function missingLinkedStyle(node, field, styleField) {
+  const direct = safeNodeValue(node, field, null);
+  if (Array.isArray(direct) && direct.length > 0) return false;
+  const id = safeNodeValue(node, styleField, "");
+  if (typeof id !== "string" || !id) return false;
+  const style = designStyleCache.get(id);
+  return !style || !Array.isArray(style.paints);
+}
+
+function linkedPaints(node, field, styleField) {
+  const direct = safeNodeValue(node, field, null);
+  // Figma normally returns effective paints even for linked styles. The style is a
+  // fallback only for hosts/files that do not materialize the linked paint list.
+  if (Array.isArray(direct) && direct.length > 0) return direct;
+  const id = safeNodeValue(node, styleField, "");
+  const style = typeof id === "string" ? designStyleCache.get(id) : null;
+  if (style && Array.isArray(style.paints)) return style.paints;
+  if (typeof id === "string" && id) {
+    diagnostic(node, "E_STYLE_UNRESOLVED",
+      "Linked Figma paint style " + id + " could not be resolved; no paint was exported.",
+      "Unsupported");
+  }
+  return Array.isArray(direct) ? direct : [];
+}
+
 function visiblePaints(node) {
   if (exportContext && exportContext.paints.has(node)) return exportContext.paints.get(node);
-  let result = [];
-  if (!("fills" in node) || isMixed(node.fills) || !Array.isArray(node.fills)) {
-    if ("fills" in node && isMixed(node.fills)) {
-      diagnostic(node, "W_MIXED_FILL", "Mixed fills were replaced with transparent paint.");
-    }
-  } else {
-    result = node.fills.filter((paint) => paint && paint.visible !== false);
-  }
+  if ("fills" in node && isMixed(node.fills))
+    diagnostic(node, "W_MIXED_FILL", "Mixed fills were replaced with transparent paint.");
+  const result = resolvedPaintList(node, linkedPaints(node, "fills", "fillStyleId"), "fills");
   if (exportContext) exportContext.paints.set(node, result);
   return result;
 }
@@ -299,16 +387,77 @@ function imagePlaceholderPaint(paint, opacity) {
 
 function visibleStrokes(node) {
   if (exportContext && exportContext.strokes.has(node)) return exportContext.strokes.get(node);
-  let result = [];
-  if (!("strokes" in node) || isMixed(node.strokes) || !Array.isArray(node.strokes)) {
-    if ("strokes" in node && isMixed(node.strokes)) {
-      diagnostic(node, "W_MIXED_STROKE", "Mixed strokes were replaced with transparent paint.");
-    }
-  } else {
-    result = node.strokes.filter((paint) => paint && paint.visible !== false);
-  }
+  if ("strokes" in node && isMixed(node.strokes))
+    diagnostic(node, "W_MIXED_STROKE", "Mixed strokes were replaced with transparent paint.");
+  const result = resolvedPaintList(node, linkedPaints(node, "strokes", "strokeStyleId"), "strokes");
   if (exportContext) exportContext.strokes.set(node, result);
   return result;
+}
+
+function gradientStopsCollapse(stops) {
+  if (!Array.isArray(stops) || stops.length <= 2) return false;
+  const toKey = (stop) => {
+    const color = stop && stop.color;
+    if (!color) return "";
+    return [color.r, color.g, color.b, color.a === undefined ? 1 : color.a]
+      .map((value) => Math.round(finite(value, 0) * 10000)).join(",");
+  };
+  const first = toKey(stops[0]);
+  const last = toKey(stops[stops.length - 1]);
+  return first !== "" && first === last && stops.some(
+    (stop) => toKey(stop) !== first);
+}
+
+function gradientHandles(transform) {
+  // Figma's gradientTransform maps normalized node coordinates INTO gradient space.
+  // Invert it to obtain the color-stop axis in SlugUI's normalized paint coordinates.
+  if (!Array.isArray(transform) || transform.length !== 2 ||
+      !Array.isArray(transform[0]) || !Array.isArray(transform[1])) return null;
+  const a = transform[0][0], c = transform[0][1], tx = transform[0][2];
+  const b = transform[1][0], d = transform[1][1], ty = transform[1][2];
+  if (![a, b, c, d, tx, ty].every(Number.isFinite)) return null;
+  const determinant = a * d - b * c;
+  if (Math.abs(determinant) < 1e-10) return null;
+  const point = (x, y) => ({
+    x: (d * (x - tx) - c * (y - ty)) / determinant,
+    y: (-b * (x - tx) + a * (y - ty)) / determinant,
+  });
+  return { start: point(0, 0), end: point(1, 0) };
+}
+
+// For a linear gradient, the FIRST ROW of Figma's normalized->gradient
+// affine transform gives t=a*x+b*y+c. Represent that affine t using a
+// pair of SlugUI handles: t=dot(p-origin, direction)/dot(direction,direction).
+// Inverting BOTH matrix rows into an endpoint and then projecting is wrong
+// whenever the axes are skewed/nonuniform or the second row is degenerate.
+function linearGradientHandles(transform) {
+  if (!Array.isArray(transform) || transform.length !== 2 ||
+      !Array.isArray(transform[0]) || transform[0].length !== 3) return null;
+  const [a, b, c] = transform[0];
+  if (![a, b, c].every(Number.isFinite)) return null;
+  const squared = a * a + b * b;
+  if (squared < 1e-12) return null;
+  const dx = a / squared, dy = b / squared;
+  const start = { x: -c * dx, y: -c * dy };
+  return { start, end: { x: start.x + dx, y: start.y + dy } };
+}
+
+function rectanglePaintLayers(node, lines, depth) {
+  const paints = visiblePaints(node);
+  if (paints.length < 2) {
+    attribute(lines, depth, "fill", paintListSource(node, paints, "fill"));
+    return;
+  }
+  // Figma paint arrays are back-to-front. Preserve all layers instead of
+  // silently keeping paints[0] (typically only a white undercoat).
+  attribute(lines, depth, "fill", "#00000000");
+  const colors = paints.map((paint) => paintListSource(node, [paint], "fill"));
+  attribute(lines, depth, "fill-layers", "[" + colors.join(", ") + "]");
+  for (const paint of paints) {
+    if (paint.blendMode && paint.blendMode !== "NORMAL" &&
+        paint.blendMode !== "PASS_THROUGH")
+      diagnostic(node, "W_FILL_BLEND", "Non-normal fill blend modes are not yet exact.");
+  }
 }
 
 function paintListSource(node, paints, role) {
@@ -318,7 +467,7 @@ function paintListSource(node, paints, role) {
       "Only the first visible " + role + " is exported.");
   }
   const paint = paints[0];
-  const opacity = finite(paint.opacity, 1) * finite(node.opacity, 1);
+  const opacity = finite(paint.opacity, 1) * resolvedNodeNumber(node, "opacity", 1);
   if (paint.boundVariables && Object.keys(paint.boundVariables).length > 0) {
     diagnostic(node, "W_VARIABLE_BAKED", "Bound paint variables are exported as resolved values.");
   }
@@ -335,11 +484,31 @@ function paintListSource(node, paints, role) {
       diagnostic(node, "W_EMPTY_GRADIENT", "Gradient without two stops became transparent.");
       return "#00000000";
     }
-    if (stops.length > 2) {
-      diagnostic(node, "W_GRADIENT_STOPS", "SlugUI currently keeps the first and last gradient stops.");
-    }
-    if (paint.gradientTransform) {
-      diagnostic(node, "W_GRADIENT_TRANSFORM", "Gradient transform is approximated by normalized endpoints.");
+    const isFigmaNonlinear = ["GRADIENT_ANGULAR", "GRADIENT_RADIAL",
+                              "GRADIENT_DIAMOND"].includes(paint.type);
+    if (isFigmaNonlinear) {
+      if (stops.length > 256 || stops.some((stop, index) =>
+            !Number.isFinite(stop.position) ||
+            (index > 0 && stop.position < stops[index - 1].position))) {
+        diagnostic(node, "E_GRADIENT_STOPS",
+          "Gradient requires 2..256 ordered finite stops.", "Unsupported");
+        return "#00000000";
+      }
+      const transform = finiteAffine(paint.gradientTransform);
+      if (!transform)
+        diagnostic(node, "W_GRADIENT_TRANSFORM",
+          "Gradient transform was unavailable; identity was assumed.");
+      const rows = transform || [[1,0,0],[0,1,0]];
+      const kind = {
+        GRADIENT_ANGULAR: "angular-stops",
+        GRADIENT_RADIAL: "radial-stops",
+        GRADIENT_DIAMOND: "diamond-stops",
+      }[paint.type];
+      const stopData = stops.map((stop) =>
+        "stop(" + number(stop.position) + ", " +
+        colorHex(stop.color, opacity) + ")");
+      return kind + "([" + stopData.join(", ") + "], " +
+        [...rows[0], ...rows[1]].map(matrixNumber).join(", ") + ")";
     }
     const first = colorHex(stops[0].color, opacity);
     const last = colorHex(stops[stops.length - 1].color, opacity);
@@ -352,6 +521,58 @@ function paintListSource(node, paints, role) {
     if (paint.type === "GRADIENT_ANGULAR") {
       diagnostic(node, "W_ANGULAR_GRADIENT", "Angular gradient is approximated as linear.");
     }
+    const handles = paint.gradientTransform
+      ? (paint.type === "GRADIENT_LINEAR"
+          ? linearGradientHandles(paint.gradientTransform)
+          : gradientHandles(paint.gradientTransform)) : null;
+    if (paint.gradientTransform && !handles) {
+      diagnostic(node, "W_GRADIENT_TRANSFORM", "Gradient transform is singular or invalid.");
+    }
+    if (paint.type === "GRADIENT_LINEAR" && stops.length >= 3) {
+      if (stops.length > 256) {
+        diagnostic(node, "E_GRADIENT_STOPS_LIMIT",
+          "Native multistop gradients support at most 256 stops.", "Unsupported");
+        return "#00000000";
+      }
+      if (stops.some((stop, index) => !Number.isFinite(stop.position) ||
+          (index > 0 && stop.position < stops[index - 1].position))) {
+        diagnostic(node, "E_GRADIENT_STOPS_ORDER",
+          "Native multistop gradients require ordered finite stops.", "Unsupported");
+        return "#00000000";
+      }
+      const begin = handles ? handles.start : { x: 0, y: 0 };
+      const end = handles ? handles.end : { x: 1, y: 0 };
+      const stopData = stops.map((stop) =>
+        "stop(" + number(stop.position) + ", " + colorHex(stop.color, opacity) + ")");
+      return "linear-stops([" + stopData.join(", ") + "], " +
+        [begin.x, begin.y, end.x, end.y].map(number).join(", ") + ")";
+    }
+    if (handles) {
+      // Two stops may occupy only part of the gradient axis, e.g. 20% to 80%.
+      // Moving the endpoints preserves the clamped interpolation in that interval.
+      const from = finite(stops[0].position, 0);
+      const to = finite(stops[stops.length - 1].position, 1);
+      if (to > from) {
+        const lerp = (a, b, t) => a + (b - a) * t;
+        const start = {
+          x: lerp(handles.start.x, handles.end.x, from),
+          y: lerp(handles.start.y, handles.end.y, from),
+        };
+        const end = {
+          x: lerp(handles.start.x, handles.end.x, to),
+          y: lerp(handles.start.y, handles.end.y, to),
+        };
+        if (paint.type === "GRADIENT_RADIAL" || paint.type === "GRADIENT_DIAMOND") {
+          diagnostic(node, "W_GRADIENT_SHAPE",
+            "Radial/diamond gradient shape may require Figma's secondary axis; only the main axis is represented.");
+        }
+        return (names[paint.type] || "linear") + "(" +
+          [first, last, number(start.x), number(start.y),
+            number(end.x), number(end.y)].join(", ") + ")";
+      }
+    }
+    if (paint.type === "GRADIENT_LINEAR")
+      return "linear(" + [first, last, "0", "0", "1", "0"].join(", ") + ")";
     return (names[paint.type] || "linear") + "(" + first + ", " + last + ")";
   }
   diagnostic(node, "E_UNSUPPORTED_PAINT",
@@ -402,6 +623,108 @@ function nodeBounds(node, rendered) {
   };
 }
 
+function finiteAffine(value) {
+  if (!Array.isArray(value) || value.length !== 2 ||
+      !Array.isArray(value[0]) || !Array.isArray(value[1]) ||
+      value[0].length !== 3 || value[1].length !== 3) return null;
+  const parts = [...value[0], ...value[1]];
+  return parts.every(Number.isFinite) ? value : null;
+}
+
+function invertAffine(value) {
+  const [a, c, tx] = value[0], [b, d, ty] = value[1];
+  const determinant = a * d - b * c;
+  if (Math.abs(determinant) < 1e-10) return null;
+  return [[d / determinant, -c / determinant,
+           (c * ty - d * tx) / determinant],
+          [-b / determinant, a / determinant,
+           (b * tx - a * ty) / determinant]];
+}
+
+function composeAffine(first, second) {
+  const [[a,c,tx],[b,d,ty]] = first;
+  const [[e,g,ux],[f,h,uy]] = second;
+  return [[a*e+c*f, a*g+c*h, a*ux+c*uy+tx],
+          [b*e+d*f, b*g+d*h, b*ux+d*uy+ty]];
+}
+
+// Figma's relativeTransform is relative to the nearest *container* ancestor,
+// not necessarily the direct hierarchy parent. GROUP and BOOLEAN_OPERATION
+// are transparent for Figma's position panel. Composing those matrices as if
+// they were relative to a Group double-applies the Group translation, and
+// silently flips or displaces mirrored vectors.
+function containerParent(node) {
+  let parent = safeNodeValue(node, "parent", null);
+  while (parent && (parent.type === "GROUP" || parent.type === "BOOLEAN_OPERATION"))
+    parent = safeNodeValue(parent, "parent", null);
+  return parent;
+}
+
+function fallbackWorldAffine(node) {
+  const bounds = absoluteBounds(node, false);
+  if (bounds) return [[1, 0, bounds.x], [0, 1, bounds.y]];
+  return [[1, 0, finite(safeNodeValue(node, "x", 0), 0)],
+          [0, 1, finite(safeNodeValue(node, "y", 0), 0)]];
+}
+
+function nodeWorldAffine(node, visited = new Set()) {
+  if (!node || visited.has(node)) return null;
+  visited.add(node);
+  // absoluteTransform is authoritative; its translation is the local origin
+  // on the page even when the node's AABB has a different top-left.
+  const absolute = finiteAffine(safeNodeValue(node, "absoluteTransform", null));
+  if (absolute) return absolute;
+  const local = finiteAffine(safeNodeValue(node, "relativeTransform", null));
+  if (local) {
+    const container = containerParent(node);
+    if (!container || container.type === "PAGE" ||
+        container.type === "DOCUMENT") return local;
+    const ancestor = nodeWorldAffine(container, visited);
+    if (ancestor) return composeAffine(ancestor, local);
+    return local;
+  }
+  return fallbackWorldAffine(node);
+}
+
+function nodeAffine(node, parentNode) {
+  const absolute = nodeWorldAffine(node);
+  if (!absolute) return null;
+  if (!parentNode) return absolute;
+  const ancestor = nodeWorldAffine(parentNode);
+  if (!ancestor) return null;
+  const inverse = invertAffine(ancestor);
+  return inverse ? composeAffine(inverse, absolute) : null;
+}
+
+function nodeLocalFrame(node, parentNode, selectionBounds, fallback) {
+  const matrix = nodeAffine(node, parentNode);
+  if (!matrix) return {bounds: fallback, matrix: null, relative: false};
+  const authoredWidth = finite(safeNodeValue(node, "width", fallback.width), fallback.width);
+  const authoredHeight = finite(safeNodeValue(node, "height", fallback.height), fallback.height);
+  // Zero-sized Figma LINE nodes use an expanded stroke/render AABB so their
+  // SVG outline can be normalized without a singular owner extent.
+  const width = nodeKind(node) === "Shape" && authoredWidth <= 0 && fallback.width > 0
+    ? fallback.width : authoredWidth;
+  const height = nodeKind(node) === "Shape" && authoredHeight <= 0 && fallback.height > 0
+    ? fallback.height : authoredHeight;
+  const selectedLeft = parentNode ? 0 : selectionBounds.x;
+  const selectedTop = parentNode ? 0 : selectionBounds.y;
+  return {
+    bounds: {x: matrix[0][2] - selectedLeft, y: matrix[1][2] - selectedTop,
+             width: Math.max(0, width), height: Math.max(0, height)},
+    matrix, relative: true,
+  };
+}
+
+function emitLocalAffine(node, matrix, lines, depth) {
+  if (!matrix) return;
+  const [a, c] = matrix[0], [b, d] = matrix[1];
+  if ([a-1, b, c, d-1].some((value) => Math.abs(value) > 1e-6)) {
+    attribute(lines, depth, "transform", "[" +
+      [a, b, c, d].map(matrixNumber).join(", ") + "]");
+  }
+}
+
 function exportBounds(node) {
   if (exportContext && exportContext.bounds.has(node)) return exportContext.bounds.get(node);
   const bounds = nodeBounds(node, false);
@@ -449,6 +772,54 @@ function vectorGeometrySignature(node) {
   ].join("~");
 }
 
+// When outlineStroke() returns a NEW outlined node, its fillGeometry is
+// normalized to the outlined node's own origin (0,0). Placing that geometry at
+// the original node origin shifts an OUTSIDE stroke right/down by its full
+// width. Figma's original node width/height exclude that outward expansion.
+// Use the *authored contour* as the anchor in local coordinates, independent
+// of absoluteBoundingBox, ancestor transforms, or rotation.
+function localOutlinedStrokeBounds(node, outlined) {
+  const width = finite(safeNodeValue(node, "width", 0), 0);
+  const height = finite(safeNodeValue(node, "height", 0), 0);
+  if (width <= 0 || height <= 0) return null;  // LINE uses its render bounds
+  const align = String(safeNodeValue(node, "strokeAlign", "CENTER"));
+  const outside = align === "OUTSIDE" ? 1 : align === "CENTER" ? 0.5 : 0;
+  const base = Math.max(0, resolvedNodeNumber(node, "strokeWeight", 0));
+  const side = (name) => isMixed(node.strokeWeight)
+    ? Math.max(0, resolvedNodeNumber(node, name, base))
+    : base;
+  const left = side("strokeLeftWeight") * outside;
+  const top = side("strokeTopWeight") * outside;
+  const right = side("strokeRightWeight") * outside;
+  const bottom = side("strokeBottomWeight") * outside;
+  const expectedWidth = width + left + right;
+  const expectedHeight = height + top + bottom;
+  // Figma keeps more precision in the outlined geometry than in displayed
+  // strokeWeight (0.9375 is often exposed as 0.938). Preserve the measured
+  // shape size and distribute its margin using authored side ratios.
+  const outlinedWidth = finite(safeNodeValue(outlined, "width", NaN), NaN);
+  const outlinedHeight = finite(safeNodeValue(outlined, "height", NaN), NaN);
+  const actualWidth = outlinedWidth > 0 && Math.abs(outlinedWidth - expectedWidth) < 0.1
+    ? outlinedWidth : expectedWidth;
+  const actualHeight = outlinedHeight > 0 && Math.abs(outlinedHeight - expectedHeight) < 0.1
+    ? outlinedHeight : expectedHeight;
+  const extraX = actualWidth - width;
+  const extraY = actualHeight - height;
+  return {
+    x: -(left + right > 0 ? extraX * left / (left + right) : 0),
+    y: -(top + bottom > 0 ? extraY * top / (top + bottom) : 0),
+    width:actualWidth, height:actualHeight,
+  };
+}
+
+function localStrokePlacementSource(bounds, ownerBounds) {
+  if (!bounds || ownerBounds.width <= 0 || ownerBounds.height <= 0) return null;
+  // SlugUI stroke-placement is stored in authored PIXELS, not normalized
+  // coordinates. The AOT compiler divides these values by owner width/height.
+  return "[" + [bounds.x, bounds.y, bounds.width, bounds.height]
+    .map((value) => matrixNumber(value) + "px").join(", ") + "]";
+}
+
 function bakedVectorGeometry(node) {
   const cacheKey = String(node.id || "");
   const cached = cacheKey ? vectorGeometryCache.get(cacheKey) : null;
@@ -464,10 +835,12 @@ function bakedVectorGeometry(node) {
       fillBounds: cached.result.fillPaths.length > 0 ? nodeBounds(node, false) : null,
       strokePaths: cached.result.strokePaths,
       strokeBounds: cached.result.strokePaths.length > 0 ? absoluteBounds(node, true) : null,
+      strokeLocalBounds: cached.result.strokeLocalBounds,
     };
   }
 
-  const result = { fillPaths: [], fillBounds: null, strokePaths: [], strokeBounds: null };
+  const result = { fillPaths: [], fillBounds: null, strokePaths: [],
+                   strokeBounds: null, strokeLocalBounds: null };
   let cacheable = true;
   if (hasVisualFill(node)) {
     try {
@@ -504,12 +877,18 @@ function bakedVectorGeometry(node) {
         if (!outlined) throw new Error("outlineStroke returned no geometry");
         result.strokePaths = fillGeometryPaths(outlined);
         result.strokeBounds = absoluteBounds(node, true);
+        // outlineStroke() returns an independent local shape. Its path viewport
+        // starts at the *expanded* bounding box, NOT at node (0,0).
+        // Example: 25px circle + 0.938px OUTSIDE stroke -> x=-0.938,
+        // width=26.876, rather than x=0 and width=26.876.
+        result.strokeLocalBounds = localOutlinedStrokeBounds(node, outlined);
         if (result.strokePaths.length === 0) throw new Error("outlined stroke has no fillGeometry");
       }
     } catch (error) {
       cacheable = false;
       result.strokePaths = [];
       result.strokeBounds = null;
+      result.strokeLocalBounds = null;
       diagnostic(node, "E_VECTOR_STROKE_OUTLINE",
         "Figma could not create exact stroke geometry: " +
           (error && error.message ? error.message : error), "Unsupported");
@@ -703,6 +1082,13 @@ function styledTextNeedsApproximation(node, segments) {
   });
 }
 
+function hasRoundedClip(node) {
+  if (safeNodeValue(node, "clipsContent", false) !== true) return false;
+  return ["cornerRadius", "topLeftRadius", "topRightRadius",
+    "bottomRightRadius", "bottomLeftRadius"].some(
+    (field) => resolvedNodeNumber(node, field, 0) > 0);
+}
+
 function fidelityFor(node, vectorGeometry, textSegments) {
   if (["VECTOR", "BOOLEAN_OPERATION", "ELLIPSE", "POLYGON", "STAR", "LINE"].includes(node.type)) {
     if ((hasVisualFill(node) && (!vectorGeometry || vectorGeometry.fillPaths.length === 0)) ||
@@ -710,21 +1096,35 @@ function fidelityFor(node, vectorGeometry, textSegments) {
       return "unsupported";
     }
     const paths = vectorGeometry.fillPaths.concat(vectorGeometry.strokePaths);
-    return paths.some((path) => path.windingRule === "EVENODD")
-      ? "approximated" : "baked-vector";
+    return "baked-vector";
   }
   const styledText = node.type === "TEXT" && textSegments && textSegments.length > 0;
+  if (missingLinkedStyle(node, "fills", "fillStyleId") ||
+      missingLinkedStyle(node, "strokes", "strokeStyleId")) return "unsupported";
+  if (hasRoundedClip(node) && resolvedNodeNumber(node, "cornerSmoothing", 0) > 0.0001)
+    return "approximated";
   if (styledText && styledTextNeedsApproximation(node, textSegments)) return "approximated";
   if (!styledText && "fills" in node && isMixed(node.fills)) return "approximated";
   const paints = styledText ? [] : visiblePaints(node);
   if (paints.length > 0) {
-    const paint = paints[0];
-    if (paint.type === "IMAGE") return "approximated";
-    if (["VIDEO", "PATTERN", "SHADER"].includes(paint.type)) return "unsupported";
-    if (paint.boundVariables && Object.keys(paint.boundVariables).length > 0) return "approximated";
-    if (paint.type === "GRADIENT_ANGULAR" || paint.gradientTransform ||
-        (Array.isArray(paint.gradientStops) && paint.gradientStops.length !== 2)) {
-      return "approximated";
+    for (const paint of paints) {
+      if (paint.type === "IMAGE") return "approximated";
+      if (["VIDEO", "PATTERN", "SHADER"].includes(paint.type)) return "unsupported";
+      if (paint.boundVariables && Object.keys(paint.boundVariables).length > 0)
+        return "approximated";
+      if (paint.blendMode && !["NORMAL", "PASS_THROUGH"].includes(paint.blendMode))
+        return "approximated";
+      if (paint.type && paint.type.indexOf("GRADIENT_") === 0) {
+        const stops = paint.gradientStops;
+        if (Array.isArray(stops) && stops.length > 256) return "unsupported";
+        if (!Array.isArray(stops) || stops.length < 2) return "approximated";
+        if (paint.type === "GRADIENT_LINEAR") {
+          if (paint.gradientTransform && !linearGradientHandles(paint.gradientTransform))
+            return "approximated";
+        } else if (!finiteAffine(paint.gradientTransform)) {
+          return "approximated";
+        }
+      }
     }
   }
   if (node.effects && !isMixed(node.effects) && node.effects.some((effect) => effect.visible !== false)) {
@@ -737,10 +1137,15 @@ function fidelityFor(node, vectorGeometry, textSegments) {
   if (finite(node.opacity, 1) < 0.9995 && childrenOf(node).length > 0) {
     return "approximated";
   }
-  if (!styledText && visiblePaints(node).length > 1) return "approximated";
+  if (!styledText && visiblePaints(node).length > 1 &&
+      !["FRAME", "RECTANGLE", "COMPONENT", "INSTANCE"].includes(node.type))
+    return "approximated";
   const rotation = safeNodeValue(node, "rotation", 0);
-  if ((typeof rotation === "number" && Number.isFinite(rotation) && Math.abs(rotation) > 0.0001) ||
-      hasNonIdentityAxes(safeNodeValue(node, "relativeTransform", null))) {
+  if (((typeof rotation === "number" && Number.isFinite(rotation) &&
+        Math.abs(rotation) > 0.0001) ||
+        hasNonIdentityAxes(safeNodeValue(node, "relativeTransform", null))) &&
+      !finiteAffine(safeNodeValue(node, "relativeTransform", null)) &&
+      !finiteAffine(safeNodeValue(node, "absoluteTransform", null))) {
     return "approximated";
   }
   const transformModifiers = safeNodeValue(node, "transformModifiers", null);
@@ -817,6 +1222,76 @@ function selectedInstances(selection) {
     }
   }
   return result;
+}
+
+function primeDesignTokens(selection) {
+  const variableIds = new Set();
+  const styleIds = new Set();
+  const scanAliases = (value, depth) => {
+    if (!value || depth > 6 || typeof value !== "object") return;
+    const alias = variableAlias(value);
+    if (alias) { variableIds.add(alias.id); return; }
+    if (Array.isArray(value)) {
+      for (const entry of value) scanAliases(entry, depth + 1);
+    } else {
+      for (const entry of Object.values(value)) scanAliases(entry, depth + 1);
+    }
+  };
+  const scanPaints = (paints) => {
+    if (!Array.isArray(paints)) return;
+    for (const paint of paints) {
+      if (!paint || typeof paint !== "object") continue;
+      scanAliases(paint.boundVariables, 0);
+      if (Array.isArray(paint.gradientStops)) {
+        for (const stop of paint.gradientStops)
+          scanAliases(stop && stop.boundVariables, 0);
+      }
+    }
+  };
+  const stack = topLevelSelection(Array.from(selection || []));
+  const seen = new Set();
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== "object" || seen.has(node)) continue;
+    seen.add(node);
+    scanAliases(safeNodeValue(node, "boundVariables", null), 0);
+    scanPaints(safeNodeValue(node, "fills", null));
+    scanPaints(safeNodeValue(node, "strokes", null));
+    for (const [field, paintsField] of [
+      ["fillStyleId", "fills"], ["strokeStyleId", "strokes"]]) {
+      const id = safeNodeValue(node, field, "");
+      const paints = safeNodeValue(node, paintsField, null);
+      // The node's materialized paints are the most accurate mode-aware snapshot.
+      if (typeof id === "string" && id && (!Array.isArray(paints) || paints.length === 0))
+        styleIds.add(id);
+    }
+    for (const child of allChildrenOf(node)) stack.push(child);
+  }
+  const pending = [];
+  for (const id of styleIds) {
+    if (designStyleCache.has(id)) continue;
+    designStyleCache.set(id, null);
+    if (typeof figma.getStyleByIdAsync === "function") {
+      pending.push(Promise.resolve().then(() => figma.getStyleByIdAsync(id)).then(
+        (style) => designStyleCache.set(id, style || null),
+        () => designStyleCache.set(id, null)));
+    }
+  }
+  // Once linked style paint data is fetched, scan any variable aliases it contains
+  // on the next refresh pass. This avoids assuming a library's default mode.
+  for (const style of designStyleCache.values())
+    if (style) scanPaints(style.paints);
+  for (const id of variableIds) {
+    if (designVariableCache.has(id)) continue;
+    designVariableCache.set(id, null);
+    if (figma.variables && typeof figma.variables.getVariableByIdAsync === "function") {
+      pending.push(Promise.resolve().then(() =>
+        figma.variables.getVariableByIdAsync(id)).then(
+        (variable) => designVariableCache.set(id, variable || null),
+        () => designVariableCache.set(id, null)));
+    }
+  }
+  return pending.length > 0 ? Promise.all(pending) : null;
 }
 
 function primeImageInfo(selection) {
@@ -933,6 +1408,10 @@ function emitSourceMetadata(node, lines, depth, fidelity) {
   attribute(lines, depth, "source-name", slugString(node.name || ""));
 
   const providerData = { nodeType: String(node.type || "") };
+  for (const field of ["fillStyleId", "strokeStyleId", "textStyleId", "effectStyleId"]) {
+    const value = safeNodeValue(node, field, "");
+    if (typeof value === "string" && value) providerData[field] = value;
+  }
   if (node.parent && node.parent.id) providerData.parentNodeId = String(node.parent.id);
   const constraints = safeNodeValue(node, "constraints", null);
   if (constraints && typeof constraints === "object") providerData.constraints = constraints;
@@ -955,6 +1434,22 @@ function emitSourceMetadata(node, lines, depth, fidelity) {
   // Metadata inspection must not emit fill diagnostics (notably mixed rich-text fills).
   const rawFills = ("fills" in node && !isMixed(node.fills) && Array.isArray(node.fills))
     ? node.fills : [];
+  const gradientFills = rawFills.filter((paint) =>
+    paint && paint.visible !== false &&
+    String(paint.type || "").startsWith("GRADIENT_"));
+  if (gradientFills.length) {
+    providerData.gradientAudit = gradientFills.map((paint) => {
+      const stops = Array.isArray(paint.gradientStops) ? paint.gradientStops : [];
+      return {
+        type:paint.type, stopCount:stops.length,
+        positions:stops.map((stop)=>stop.position),
+        first:stops.length?stops[0].color:null,
+        middle:stops.length?stops[Math.floor(stops.length/2)].color:null,
+        last:stops.length?stops[stops.length-1].color:null,
+        transform:paint.gradientTransform || null,
+      };
+    });
+  }
   const imageFills = rawFills.filter(
     (paint) => paint && paint.visible !== false && paint.type === "IMAGE");
   if (imageFills.length > 0) {
@@ -1214,7 +1709,13 @@ function emitContainerLayout(node, kind, lines, depth) {
       attribute(lines, depth, "cross-align", align[node.counterAxisAlignItems]);
     }
   }
-  if (node.clipsContent === true) attribute(lines, depth, "clip", "true");
+  if (node.clipsContent === true) {
+    attribute(lines, depth, "clip", "true");
+    if (hasRoundedClip(node) && resolvedNodeNumber(node, "cornerSmoothing", 0) > 0.0001) {
+      diagnostic(node, "W_ROUNDED_CLIP_SMOOTHING",
+        "Rounded child clipping is native, but nonzero Figma corner smoothing uses a GPU superellipse approximation.");
+    }
+  }
 }
 
 function emitCorners(node, lines, depth) {
@@ -1242,13 +1743,13 @@ function emitStroke(node, lines, depth) {
   if (strokes.length === 0) return;
   attribute(lines, depth, "stroke", strokePaintSource(node));
 
-  let width = typeof node.strokeWeight === "number" ? node.strokeWeight : 1;
+  let width = resolvedNodeNumber(node, "strokeWeight", 1);
   if (isMixed(node.strokeWeight)) {
     const sides = [
-      finite(node.strokeTopWeight, 0),
-      finite(node.strokeRightWeight, 0),
-      finite(node.strokeBottomWeight, 0),
-      finite(node.strokeLeftWeight, 0),
+      resolvedNodeNumber(node, "strokeTopWeight", 0),
+      resolvedNodeNumber(node, "strokeRightWeight", 0),
+      resolvedNodeNumber(node, "strokeBottomWeight", 0),
+      resolvedNodeNumber(node, "strokeLeftWeight", 0),
     ];
     attribute(lines, depth, "stroke-width",
       "[" + sides.map(number).join(", ") + "]");
@@ -1359,7 +1860,7 @@ function textRunSource(node, segment) {
   const weight = Math.max(1, Math.min(1000, inferredTextWeight(segment, 400)));
   const decoration = String(segment.textDecoration || "NONE");
   const paints = Array.isArray(segment.fills)
-    ? segment.fills.filter((paint) => paint && paint.visible !== false)
+    ? resolvedPaintList(node, segment.fills, "fills")
     : visiblePaints(node);
   const fontStyle = segment.fontName && typeof segment.fontName.style === "string"
     ? segment.fontName.style : String(segment.fontStyle || "");
@@ -1461,7 +1962,7 @@ function emitText(node, lines, depth, segments, textProperty) {
   }
   const basePaint = rich && segments.length > 0
     ? paintListSource(node, Array.isArray(segments[0].fills)
-      ? segments[0].fills.filter((paint) => paint && paint.visible !== false) : [], "fill")
+      ? resolvedPaintList(node, segments[0].fills, "fills") : [], "fill")
     : paintSource(node);
   attribute(lines, depth, "fill", basePaint);
   if (rich) {
@@ -1471,8 +1972,7 @@ function emitText(node, lines, depth, segments, textProperty) {
 }
 
 function emitImagePlaceholder(node, lines, depth) {
-  const fills = ("fills" in node && !isMixed(node.fills) && Array.isArray(node.fills))
-    ? node.fills : [];
+  const fills = linkedPaints(node, "fills", "fillStyleId");
   const paint = fills.find((candidate) =>
     candidate && candidate.visible !== false && candidate.type === "IMAGE");
   if (!paint) return;
@@ -1487,7 +1987,7 @@ function emitImagePlaceholder(node, lines, depth) {
     attribute(lines, depth, "image-scale-mode", mode);
 }
 
-function emitNode(node, parentMode, isRoot, lines, depth, parentBounds) {
+function emitNode(node, parentMode, isRoot, lines, depth, parentBounds, parentNode = null) {
   if (exportContext) {
     exportContext.nodeCount += 1;
     if (node && node.id) exportContext.nodeIds.add(String(node.id));
@@ -1495,12 +1995,45 @@ function emitNode(node, parentMode, isRoot, lines, depth, parentBounds) {
   const kind = nodeKind(node);
   const vectorGeometry = kind === "Shape" ? bakedVectorGeometry(node) : null;
   const textSegments = kind === "Text" ? styledTextSegments(node) : null;
-  const bounds = exportBounds(node);
+  const originalBounds = exportBounds(node);
+  const local = nodeLocalFrame(node, parentNode, parentBounds, originalBounds);
+  const bounds = local.bounds;
+  const effectiveParentBounds = local.relative
+    ? {x: 0, y: 0, width: parentBounds.width, height: parentBounds.height}
+    : parentBounds;
+  if (exportContext) {
+    if (local.matrix && local.matrix[0][0] * local.matrix[1][1] -
+        local.matrix[0][1] * local.matrix[1][0] < -0.000001)
+      exportContext.mirroredNodeCount++;
+    if (kind !== "Text") {
+      for (const paint of visiblePaints(node)) {
+        if (!String(paint.type || "").startsWith("GRADIENT_")) continue;
+        exportContext.gradientPaintCount++;
+        const stops = Array.isArray(paint.gradientStops) ? paint.gradientStops : [];
+        if (stops.length >= 3) exportContext.multistopGradientCount++;
+        if (stops.length >= 2) {
+          const unique = new Set(stops.map((stop) => {
+            const color = stop && stop.color || {};
+            return [color.r,color.g,color.b,color.a===undefined?1:color.a]
+              .map((value)=>Math.round(finite(value,0)*65535)).join(",");
+          }));
+          if (unique.size === 1) {
+            exportContext.flatGradientCount++;
+            diagnostic(node, "W_FLAT_GRADIENT",
+              "Figma exposes " + stops.length + " identical color stops (" +
+              paint.type + "). No multicolor gradient can be reconstructed " +
+              "from these values. Inspect the original Figma paint.");
+          }
+        }
+      }
+    }
+  }
   const fidelity = fidelityFor(node, vectorGeometry, textSegments);
   const fidelityCount = fidelity === "baked-vector" ? "bakedVector" : fidelity;
   fidelityCounts[fidelityCount] += 1;
   push(lines, depth, kind + " " + elementName(node) + " {");
-  emitSizeAndPosition(node, kind, parentMode, isRoot, lines, depth + 1, parentBounds, bounds);
+  emitSizeAndPosition(node, kind, parentMode, isRoot, lines, depth + 1, effectiveParentBounds, bounds);
+  emitLocalAffine(node, local.matrix, lines, depth + 1);
   const visibleProperty = runtimePropertyReference(node, "visible", "BOOLEAN");
   if (visibleProperty) attribute(lines, depth + 1, "visible", "$" + visibleProperty);
 
@@ -1508,7 +2041,7 @@ function emitNode(node, parentMode, isRoot, lines, depth, parentBounds) {
     emitContainerLayout(node, kind, lines, depth + 1);
   }
   if (kind === "Rectangle") {
-    attribute(lines, depth + 1, "fill", paintSource(node));
+    rectanglePaintLayers(node, lines, depth + 1);
     emitImagePlaceholder(node, lines, depth + 1);
     emitCorners(node, lines, depth + 1);
     emitStroke(node, lines, depth + 1);
@@ -1517,19 +2050,27 @@ function emitNode(node, parentMode, isRoot, lines, depth, parentBounds) {
       runtimePropertyReference(node, "characters", "TEXT"));
   } else if (kind === "Shape") {
     const ownerBounds = bounds;
+    const hasLocalRotation = local.matrix &&
+      [local.matrix[0][0]-1, local.matrix[1][0],
+       local.matrix[0][1], local.matrix[1][1]-1]
+        .some((value) => Math.abs(value) > 0.000001);
     const fillPaths = vectorGeometry ? vectorGeometry.fillPaths : [];
     const strokePaths = vectorGeometry ? vectorGeometry.strokePaths : [];
     if (fillPaths.length > 0) {
       attribute(lines, depth + 1, "path-data", pathDataValue(fillPaths));
       attribute(lines, depth + 1, "path-winding-rules", pathWindingValue(fillPaths));
-      const placement = placementSource(vectorGeometry.fillBounds, ownerBounds);
+      const placement = hasLocalRotation ? null :
+        placementSource(vectorGeometry.fillBounds, originalBounds);
       if (placement) attribute(lines, depth + 1, "path-placement", placement);
       attribute(lines, depth + 1, "fill", paintSource(node));
     }
     if (strokePaths.length > 0) {
       attribute(lines, depth + 1, "stroke-path-data", pathDataValue(strokePaths));
       attribute(lines, depth + 1, "stroke-winding-rules", pathWindingValue(strokePaths));
-      const placement = placementSource(vectorGeometry.strokeBounds, ownerBounds);
+      const placement = vectorGeometry.strokeLocalBounds
+        ? localStrokePlacementSource(vectorGeometry.strokeLocalBounds, bounds)
+        : (hasLocalRotation ? null :
+           placementSource(vectorGeometry.strokeBounds, originalBounds));
       if (placement) attribute(lines, depth + 1, "stroke-placement", placement);
       emitStroke(node, lines, depth + 1);
     }
@@ -1555,9 +2096,10 @@ function emitNode(node, parentMode, isRoot, lines, depth, parentBounds) {
     diagnostic(node, "W_GROUP_OPACITY",
       "Container opacity is baked into its own fill but does not yet isolate descendant compositing.");
   }
-  if (hasNonIdentityAxes(safeNodeValue(node, "relativeTransform", null))) {
-    diagnostic(node, "W_TRANSFORM",
-      "Rotation/skew transform metadata is preserved, but current SlugUI layout remains axis-aligned.");
+  if (local.matrix && local.matrix.some((row) =>
+        !row.every((component) => Number.isFinite(component)))) {
+    diagnostic(node, "E_TRANSFORM_NONFINITE", "Invalid transform is not representable.",
+      "Unsupported");
   }
   const transformModifiers = safeNodeValue(node, "transformModifiers", null);
   if (Array.isArray(transformModifiers) && transformModifiers.length > 0) {
@@ -1576,7 +2118,10 @@ function emitNode(node, parentMode, isRoot, lines, depth, parentBounds) {
   const childParentMode = exportedLayout === "row"
     ? "HORIZONTAL" : exportedLayout === "column" ? "VERTICAL" : "NONE";
   for (const child of childrenOf(node)) {
-    emitNode(child, childParentMode, false, lines, depth + 1, bounds);
+    emitNode(child, childParentMode, false, lines, depth + 1,
+      local.relative
+        ? {x: 0, y: 0, width: bounds.width, height: bounds.height}
+        : originalBounds, node);
   }
   push(lines, depth, "}");
 }
@@ -1609,6 +2154,7 @@ function buildSelectionExport(selection) {
   const component = componentName(selection);
   const lines = [
     "// SlugUI exchange format " + FORMAT_VERSION + ", generated by the Figma selection exporter.",
+    "// exporter-revision: " + EXPORTER_REVISION,
     "component " + component + " {",
   ];
   const liveProperties = runtimeComponentProperties(selection);
@@ -1651,6 +2197,10 @@ function exportSelection(selection) {
       vectorCacheHits: exportContext.vectorCacheHits,
       textCacheHits: exportContext.textCacheHits,
       generationMs: Math.max(0, Date.now() - started),
+      gradientPaintCount: exportContext.gradientPaintCount,
+      multistopGradientCount: exportContext.multistopGradientCount,
+      flatGradientCount: exportContext.flatGradientCount,
+      mirroredNodeCount: exportContext.mirroredNodeCount,
     };
     lastExportUsedTemporaryMutation = exportContext.temporaryMutation;
     lastExportNodeIds = exportContext.nodeIds;
@@ -1685,8 +2235,9 @@ function refreshSelection(force) {
   // synchronous and keep the fast interaction path.
   const pendingComponents = primeMainComponents(selection);
   const pendingImages = primeImageInfo(selection);
-  if (pendingComponents || pendingImages) {
-    Promise.all([pendingComponents, pendingImages].filter(Boolean)).then(() => {
+  const pendingTokens = primeDesignTokens(selection);
+  if (pendingComponents || pendingImages || pendingTokens) {
+    Promise.all([pendingComponents, pendingImages, pendingTokens].filter(Boolean)).then(() => {
       if (revision === refreshRevision) refreshSelection(true);
     });
     return;
@@ -1708,6 +2259,7 @@ function refreshSelection(force) {
       sourceLength: lastExportSource.length,
       selectionCount: selection.length,
       formatVersion: FORMAT_VERSION,
+      exporterRevision: EXPORTER_REVISION,
     });
   } catch (error) {
     lastExportSource = "";
@@ -1726,6 +2278,7 @@ function refreshSelection(force) {
       }],
       fidelityCounts: { native: 0, approximated: 0, bakedVector: 0, unsupported: 0 },
       stats: { nodeCount: 0, vectorCacheHits: 0, textCacheHits: 0, generationMs: 0 },
+      exporterRevision: EXPORTER_REVISION,
     });
   } finally {
     // outlineStroke() creates and removes a temporary Figma node. Ignore only the immediate
@@ -1800,6 +2353,8 @@ function queueDocumentRefresh(changes, dependencyHit, selectedHit) {
 
   if (changes) {
     if (!dependencyHit && !selectedHit) return;
+    designVariableCache.clear();
+    designStyleCache.clear();
     if (dependencyHit || changes.structural) {
       // A definition edit or tree-shape edit can affect many descendants at once.
       invalidateCaches(lastExportNodeIds);
@@ -1810,6 +2365,8 @@ function queueDocumentRefresh(changes, dependencyHit, selectedHit) {
     vectorGeometryCache.clear();
     styledTextCache.clear();
     mainComponentCache.clear();
+    designVariableCache.clear();
+    designStyleCache.clear();
   }
 
   const run = () => {
@@ -1867,7 +2424,12 @@ function bindCurrentPageChanges() {
 
 figma.showUI(__html__, { width: 580, height: 700, themeColors: true });
 figma.ui.onmessage = (message) => {
-  if (!message || message.type === "refresh") refreshSelection(true);
+  if (!message || message.type === "refresh") {
+    // Explicit refresh must re-read updated linked library values, not stale cached tokens.
+    designVariableCache.clear();
+    designStyleCache.clear();
+    refreshSelection(true);
+  }
   if (message && message.type === "request-source") {
     const action = message.action === "download" ? "download" : "copy";
     figma.ui.postMessage({
@@ -1876,6 +2438,25 @@ figma.ui.onmessage = (message) => {
       source: lastExportSource,
       filename: lastExportFilename,
     });
+  }
+  if (message && message.type === "reference-png") {
+    const selection = topLevelSelection(Array.from(figma.currentPage.selection || []));
+    if (selection.length !== 1 || typeof selection[0].exportAsync !== "function") {
+      figma.ui.postMessage({type:"reference-error",
+        message:"Select exactly one Figma Frame to export a native reference PNG."});
+    } else {
+      const selected = selection[0];
+      Promise.resolve().then(() => selected.exportAsync({
+        format:"PNG", contentsOnly:true,
+        constraint:{type:"SCALE",value:1},
+      })).then((data) => figma.ui.postMessage({
+        type:"reference-payload", png:Array.from(data),
+        filename:(lastExportFilename || "FigmaSelection.slugui")
+          .replace(/\.slugui$/, ".figma-reference.png"),
+      })).catch((error)=>figma.ui.postMessage({
+        type:"reference-error", message:String(error && error.message || error),
+      }));
+    }
   }
   if (message && message.type === "close") figma.closePlugin();
 };
@@ -1892,6 +2473,8 @@ figma.on("currentpagechange", () => {
   vectorGeometryCache.clear();
   styledTextCache.clear();
   mainComponentCache.clear();
+  designVariableCache.clear();
+  designStyleCache.clear();
   refreshSelection(true);
 });
 refreshSelection(true);

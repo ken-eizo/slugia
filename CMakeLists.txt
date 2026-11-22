@@ -363,6 +363,12 @@ if(SLUGIA_BUILD_TESTS)
     set_tests_properties(slugui_figma_exporter PROPERTIES
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
       ENVIRONMENT "SLUGUI_PYTHON=${Python3_EXECUTABLE}")
+    add_test(NAME slugui_figma_library_variables
+      COMMAND "${SLUGIA_NODE_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/figma_token_test.js")
+    set_tests_properties(slugui_figma_library_variables PROPERTIES
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      ENVIRONMENT "SLUGUI_PYTHON=${Python3_EXECUTABLE}")
   else()
     message(WARNING "Node.js was not found; the Figma exporter integration test is disabled.")
   endif()
@@ -375,6 +381,46 @@ if(SLUGIA_BUILD_GPU_TESTS)
   add_executable(slugia_gpu_tests tests/gpu_tests.cpp)
   target_link_libraries(slugia_gpu_tests PRIVATE slugia::slugia)
   add_test(NAME slugia_gpu COMMAND slugia_gpu_tests)
+  if(TARGET slugia_slugui_example_codegen)
+    # Freeze the REAL Figma v5 ColorPicker export as an independent fixture.
+    # The interactive example source changes after drag-and-drop; its generated
+    # header is NOT a stable test input. This fixture catches missing gradient
+    # stops and fill-layers even when a stale GUI happens to build successfully.
+    set(SLUGIA_COLORPICKER_FIXTURE_HEADER
+      "${SLUGIA_GENERATED_DIR}/colorpicker_v5.generated.hpp")
+    slugia_compile_slugui(
+      STAMPED STRIP_SOURCE_METADATA
+      INPUT "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/colorpicker_v5.slugui"
+      OUTPUT "${SLUGIA_COLORPICKER_FIXTURE_HEADER}"
+      NAMESPACE slugia::regression
+      CLASS_NAME ColorPickerV5Generated)
+    add_custom_target(slugia_colorpicker_fixture_codegen
+      DEPENDS "${SLUGIA_COLORPICKER_FIXTURE_HEADER}.stamp")
+    add_executable(slugia_figma_import_gpu_tests tests/figma_import_gpu_test.cpp)
+    target_link_libraries(slugia_figma_import_gpu_tests PRIVATE slugia::slugia)
+    target_include_directories(slugia_figma_import_gpu_tests PRIVATE "${SLUGIA_GENERATED_DIR}")
+    add_dependencies(slugia_figma_import_gpu_tests slugia_colorpicker_fixture_codegen)
+    set_property(SOURCE tests/figma_import_gpu_test.cpp APPEND PROPERTY
+      OBJECT_DEPENDS "${SLUGIA_COLORPICKER_FIXTURE_HEADER}")
+    if(MSVC)
+      target_compile_options(slugia_figma_import_gpu_tests PRIVATE /Od /Ob0 /bigobj)
+    endif()
+    add_test(NAME slugia_figma_colorpicker_v5 COMMAND slugia_figma_import_gpu_tests)
+    add_test(NAME slugia_figma_colorpicker_v5_research_profile
+      COMMAND slugia_figma_import_gpu_tests --research-profile)
+    set_tests_properties(slugia_figma_colorpicker_v5
+      slugia_figma_colorpicker_v5_research_profile PROPERTIES
+      LABELS "gpu;fidelity" TIMEOUT 60)
+    # The standalone GPU fixture is not enough: the real Figma Import page
+    # creates retained geometry, then starts a zoomable renderer. A mirrored
+    # VECTOR must not trigger the projected-retained exception at GUI startup.
+    if(TARGET slugia_example)
+      add_test(NAME slugia_figma_gui_import_smoke
+        COMMAND $<TARGET_FILE:slugia_example> --figma --import-success --smoke)
+      set_tests_properties(slugia_figma_gui_import_smoke PROPERTIES
+        LABELS "gpu;fidelity" TIMEOUT 90)
+    endif()
+  endif()
   set_tests_properties(slugia_gpu PROPERTIES LABELS gpu TIMEOUT 120)
   add_executable(slugia_vector_quality_tests tests/vector_quality_tests.cpp)
   target_link_libraries(slugia_vector_quality_tests PRIVATE slugia::slugia)
@@ -449,6 +495,8 @@ if(SLUGIA_BUILD_GPU_TESTS)
   if(TARGET slugia_example)
     add_test(NAME slugia_example_smoke COMMAND slugia_example --smoke)
     set_tests_properties(slugia_example_smoke PROPERTIES LABELS gpu TIMEOUT 120)
+    add_test(NAME slugia_example_idle_smoke COMMAND slugia_example --idle-smoke)
+    set_tests_properties(slugia_example_idle_smoke PROPERTIES LABELS gpu TIMEOUT 120)
   endif()
   if(TARGET slugia_vector_fast_demo)
     add_test(NAME slugia_vector_fast_smoke COMMAND slugia_vector_fast_demo --smoke)

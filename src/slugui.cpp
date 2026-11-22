@@ -260,7 +260,7 @@ Element stack(ElementId id, std::string name) {
 Element roundedRectangle(ElementId id, Paint paint, CornerRadii radii,
                          CornerSmoothing smoothing, std::string name) {
   auto result = stack(id, std::move(name));
-  result.visual = RoundedRectangleVisual{StatefulPaint{paint}, radii, smoothing, {}};
+  result.visual = RoundedRectangleVisual{StatefulPaint{paint}, {}, radii, smoothing, {}};
   return result;
 }
 
@@ -388,6 +388,10 @@ struct Runtime::Impl {
     LayoutBox box;
     const Element* element = nullptr;
     bool enabled = true;
+    RoundedClipChain roundedClips{};
+    std::size_t depth = 0;
+    ProjectiveTransform2D worldTransform{};
+    bool transformed = false;
   };
   struct FlowChild {
     const Element* element = nullptr;
@@ -827,19 +831,56 @@ struct Runtime::Impl {
 
   void append(const Element& element, Rect bounds, Rect inheritedClip,
               const PropertyStore& properties, bool ancestorEnabled,
-              bool ancestorOverlay, std::size_t depth) {
+              bool ancestorOverlay, std::size_t depth,
+              RoundedClipChain inheritedRoundedClips = {},
+              ProjectiveTransform2D parentTransform = {}) {
     ++stats.elements;
     if (!element.visible.resolve(properties)) return;
     ++stats.visibleElements;
 
     const bool enabled = ancestorEnabled && element.interaction.enabled.resolve(properties);
     const bool overlay = ancestorOverlay || element.overlay;
+    const auto& m = element.localTransform;
+    const auto& p = parentTransform.matrix;
+    // The child layout x/y are in an unrotated parent reference frame. Rotate
+    // about its own top-left, then compose with all ancestor transforms.
+    const float tx = bounds.x - m[0]*bounds.x - m[2]*bounds.y;
+    const float ty = bounds.y - m[1]*bounds.x - m[3]*bounds.y;
+    ProjectiveTransform2D world = parentTransform;
+    world.matrix = {
+      p[0]*m[0]+p[1]*m[1], p[0]*m[2]+p[1]*m[3], p[0]*tx+p[1]*ty+p[2],
+      p[3]*m[0]+p[4]*m[1], p[3]*m[2]+p[4]*m[3], p[3]*tx+p[4]*ty+p[5],
+      0.0f, 0.0f, 1.0f
+    };
+    const float transformDet =
+      world.matrix[0]*world.matrix[4] - world.matrix[1]*world.matrix[3];
+    if (!std::isfinite(transformDet) || std::abs(transformDet) < 1.0e-8f ||
+        !std::all_of(world.matrix.begin(), world.matrix.end(),
+                     [](float value) { return std::isfinite(value); }))
+      throw std::invalid_argument("SlugUI element affine transform is singular/nonfinite");
+    const std::array<float,6> inverseWorld{
+      world.matrix[4]/transformDet, -world.matrix[1]/transformDet,
+      (world.matrix[1]*world.matrix[5] - world.matrix[4]*world.matrix[2])/transformDet,
+      -world.matrix[3]/transformDet, world.matrix[0]/transformDet,
+      (world.matrix[3]*world.matrix[2] - world.matrix[0]*world.matrix[5])/transformDet
+    };
+    const bool transformed =
+      std::abs(world.matrix[0]-1) > 0.000001f ||
+      std::abs(world.matrix[1]) > 0.000001f ||
+      std::abs(world.matrix[2]) > 0.000001f ||
+      std::abs(world.matrix[3]) > 0.000001f ||
+      std::abs(world.matrix[4]-1) > 0.000001f ||
+      std::abs(world.matrix[5]) > 0.000001f;
     const std::size_t resolvedPosition = resolved.size();
     const RuntimeNodeId node{currentInstanceId, element.id};
     resolved.push_back({
       {node, element.id, bounds, inheritedClip, overlay, element.interaction.interactive},
       &element,
-      enabled
+      enabled,
+      inheritedRoundedClips,
+      depth,
+      world,
+      transformed
     });
     if (element.id != 0) resolvedIndex.try_emplace(node, resolvedPosition);
 
@@ -853,7 +894,68 @@ struct Runtime::Impl {
       std::max(0.0f, bounds.width - left - right),
       std::max(0.0f, bounds.height - top - bottom)
     };
-    const Rect childClip = element.clipsChildren ? intersect(inheritedClip, bounds) : inheritedClip;
+    // Clip bounds are a CPU culling/scissor hint, not the antialiased mask.
+    // Hard-intersecting them at the authored boundary erases the OUTSIDE
+    // 0.5-pixel Slug coverage fringe, even if the fragment mask is exact.
+    // Use a one-pixel conservative bound for rounded and fractional clips.
+    const auto integerEdge = [](float value) {
+      return std::abs(value-std::round(value))<=0.0001f;
+    };
+    const bool exactIntegerBox =
+      integerEdge(bounds.x)&&integerEdge(bounds.y)&&
+      integerEdge(bounds.x+bounds.width)&&integerEdge(bounds.y+bounds.height);
+    bool curvedClip=false;
+    if (const auto* rounded=std::get_if<RoundedRectangleVisual>(&element.visual)) {
+      const auto radii=rounded->radii.resolve(properties);
+      curvedClip=std::max({radii.topLeft,radii.topRight,
+                           radii.bottomRight,radii.bottomLeft})>0.0001f;
+    }
+    const bool softClip=element.clipsChildren&&
+      (curvedClip||!exactIntegerBox||transformed);
+    const Rect maskCull = softClip
+      ? Rect{bounds.x-1.0f,bounds.y-1.0f,bounds.width+2.0f,bounds.height+2.0f}
+      : bounds;
+    const Rect childClip=element.clipsChildren
+      ? intersect(inheritedClip,maskCull):inheritedClip;
+    RoundedClipChain childRoundedClips = inheritedRoundedClips;
+    if (element.clipsChildren) {
+      CornerRadii radii{};
+      CornerSmoothing smoothing{};
+      if (const auto* rounded = std::get_if<RoundedRectangleVisual>(&element.visual)) {
+        radii = rounded->radii.resolve(properties);
+        smoothing = rounded->smoothing.resolve(properties);
+        radii.topLeft *= scale;
+        radii.topRight *= scale;
+        radii.bottomRight *= scale;
+        radii.bottomLeft *= scale;
+        const float maximum = std::max({radii.topLeft, radii.topRight,
+                                        radii.bottomRight, radii.bottomLeft});
+        if (maximum > 0.0001f) {
+          // Normalize CSS/Figma corner sums so the four arcs cannot overlap.
+          float factor = 1.0f;
+          const auto cap = [&factor](float dimension, float first, float second) {
+            if (first + second > 0.0f)
+              factor = std::min(factor, dimension / (first + second));
+          };
+          cap(bounds.width, radii.topLeft, radii.topRight);
+          cap(bounds.width, radii.bottomLeft, radii.bottomRight);
+          cap(bounds.height, radii.topLeft, radii.bottomLeft);
+          cap(bounds.height, radii.topRight, radii.bottomRight);
+          factor = std::clamp(factor, 0.0f, 1.0f);
+          radii.topLeft *= factor;
+          radii.topRight *= factor;
+          radii.bottomRight *= factor;
+          radii.bottomLeft *= factor;
+
+        }
+      }
+      // Record even square ancestor clips; a descendant may independently
+      // rotate, in which case axis-aligned local clipRect is insufficient.
+      auto chain = std::make_shared<std::vector<RoundedClip>>();
+      if (inheritedRoundedClips) *chain = *inheritedRoundedClips;
+      chain->push_back({bounds, radii, smoothing, inverseWorld});
+      childRoundedClips = std::move(chain);
+    }
 
     if (element.layout.kind == LayoutKind::Row ||
         element.layout.kind == LayoutKind::Column) {
@@ -1021,12 +1123,12 @@ struct Runtime::Impl {
           if (child.layout.absolutePositioned) {
             const auto childSize = measure(child, properties, bounds.width, bounds.height);
             append(child, constrainedChildBounds(element, child, bounds, childSize, properties),
-                   childClip, properties, enabled, overlay, depth + 1);
+                   childClip, properties, enabled, overlay, depth + 1, childRoundedClips, world);
             continue;
           }
           if (flowIndex == 0) continue;
           const auto childBounds = children[--flowIndex].bounds;
-          append(child, childBounds, childClip, properties, enabled, overlay, depth + 1);
+          append(child, childBounds, childClip, properties, enabled, overlay, depth + 1, childRoundedClips, world);
         }
       } else {
         std::size_t flowIndex = 0;
@@ -1035,12 +1137,12 @@ struct Runtime::Impl {
           if (child.layout.absolutePositioned) {
             const auto childSize = measure(child, properties, bounds.width, bounds.height);
             append(child, constrainedChildBounds(element, child, bounds, childSize, properties),
-                   childClip, properties, enabled, overlay, depth + 1);
+                   childClip, properties, enabled, overlay, depth + 1, childRoundedClips, world);
             continue;
           }
           if (flowIndex >= children.size()) continue;
           const auto childBounds = children[flowIndex++].bounds;
-          append(child, childBounds, childClip, properties, enabled, overlay, depth + 1);
+          append(child, childBounds, childClip, properties, enabled, overlay, depth + 1, childRoundedClips, world);
         }
       }
       return;
@@ -1058,11 +1160,11 @@ struct Runtime::Impl {
         if (!length(child.layout.width, properties, inner.width)) childSize.width = inner.width;
         if (!length(child.layout.height, properties, inner.height)) childSize.height = inner.height;
         append(child, {inner.x + x, inner.y + y, childSize.width, childSize.height},
-               childClip, properties, enabled, overlay, depth + 1);
+               childClip, properties, enabled, overlay, depth + 1, childRoundedClips, world);
       } else {
         const auto childSize = measure(child, properties, bounds.width, bounds.height);
         append(child, constrainedChildBounds(element, child, bounds, childSize, properties),
-               childClip, properties, enabled, overlay, depth + 1);
+               childClip, properties, enabled, overlay, depth + 1, childRoundedClips, world);
       }
     }
   }
@@ -1095,7 +1197,23 @@ struct Runtime::Impl {
       const auto& entry = resolved[index];
       const bool nestedInstance = std::holds_alternative<InstanceVisual>(entry.element->visual);
       if ((!entry.box.interactive && !nestedInstance) || !entry.enabled) continue;
-      const Rect region = intersect(entry.box.bounds, entry.box.clip);
+      Rect region = intersect(entry.box.bounds, entry.box.clip);
+      if (entry.transformed) {
+        const auto& m = entry.worldTransform.matrix;
+        const auto map = [&](float x, float y) {
+          return Vec2{m[0]*x + m[1]*y + m[2],
+                      m[3]*x + m[4]*y + m[5]};
+        };
+        const Rect b = entry.box.bounds;
+        const std::array<Vec2,4> points{
+          map(b.x,b.y), map(b.x+b.width,b.y),
+          map(b.x+b.width,b.y+b.height), map(b.x,b.y+b.height)};
+        const float left = std::min({points[0].x,points[1].x,points[2].x,points[3].x});
+        const float top = std::min({points[0].y,points[1].y,points[2].y,points[3].y});
+        const float right = std::max({points[0].x,points[1].x,points[2].x,points[3].x});
+        const float bottom = std::max({points[0].y,points[1].y,points[2].y,points[3].y});
+        region = {left,top,right-left,bottom-top};
+      }
       if (region.width <= 0.0f || region.height <= 0.0f) continue;
       const auto minX = hitCellCoordinate(region.x);
       const auto minY = hitCellCoordinate(region.y);
@@ -1186,7 +1304,56 @@ struct Runtime::Impl {
       const bool effectiveOverlay = inheritedOverlay || entry.box.overlay;
       if (layer == HitTestLayer::Overlay && !effectiveOverlay) continue;
       if (layer == HitTestLayer::Regular && effectiveOverlay) continue;
-      if (!entry.box.bounds.contains(cursor) || !entry.box.clip.contains(cursor)) continue;
+      Vec2 authoredCursor = cursor;
+      if (entry.transformed) {
+        const auto& m = entry.worldTransform.matrix;
+        const float det = m[0]*m[4]-m[1]*m[3];
+        authoredCursor = {(m[4]*(cursor.x-m[2])-m[1]*(cursor.y-m[5]))/det,
+                          (-m[3]*(cursor.x-m[2])+m[0]*(cursor.y-m[5]))/det};
+      }
+      if (!entry.box.bounds.contains(authoredCursor) ||
+          (!entry.transformed && !entry.box.clip.contains(cursor))) continue;
+      bool roundedVisible = true;
+      if (entry.roundedClips) {
+        for (const auto& mask : *entry.roundedClips) {
+          const auto& inv = mask.inverseWorld;
+          const Vec2 maskCursor{inv[0]*cursor.x + inv[1]*cursor.y + inv[2],
+                                inv[3]*cursor.x + inv[4]*cursor.y + inv[5]};
+          if (!mask.bounds.contains(maskCursor)) {
+            roundedVisible = false;
+            break;
+          }
+          float radius = 0.0f;
+          Vec2 center = maskCursor;
+          const auto& b = mask.bounds;
+          const auto& r = mask.radii;
+          if (maskCursor.x < b.x + r.topLeft && maskCursor.y < b.y + r.topLeft) {
+            radius = r.topLeft;
+            center = {b.x + radius, b.y + radius};
+          } else if (maskCursor.x > b.x + b.width - r.topRight &&
+                     maskCursor.y < b.y + r.topRight) {
+            radius = r.topRight;
+            center = {b.x + b.width - radius, b.y + radius};
+          } else if (maskCursor.x > b.x + b.width - r.bottomRight &&
+                     maskCursor.y > b.y + b.height - r.bottomRight) {
+            radius = r.bottomRight;
+            center = {b.x + b.width - radius, b.y + b.height - radius};
+          } else if (maskCursor.x < b.x + r.bottomLeft &&
+                     maskCursor.y > b.y + b.height - r.bottomLeft) {
+            radius = r.bottomLeft;
+            center = {b.x + radius, b.y + b.height - radius};
+          }
+          if (radius > 0.0f) {
+            const auto dx = (maskCursor.x - center.x) / radius;
+            const auto dy = (maskCursor.y - center.y) / radius;
+            if (dx * dx + dy * dy > 1.0f) {
+              roundedVisible = false;
+              break;
+            }
+          }
+        }
+      }
+      if (!roundedVisible) continue;
 
       if (const auto* nested = std::get_if<InstanceVisual>(&entry.element->visual)) {
         if (const auto nestedNode = nestedHit(entry, *nested, layer, effectiveOverlay)) {
@@ -1268,8 +1435,19 @@ struct Runtime::Impl {
   }
 
   void draw(const Resolved& entry, const PropertyStore& properties,
-            const FrameInput& input, DrawList& drawList, Rect callerClip) const {
+            const FrameInput& input, DrawList& drawList, Rect callerClip,
+            bool borderOnly = false, bool deferBorder = false) const {
     drawList.setClip(intersect(entry.box.clip, callerClip));
+    if (entry.roundedClips) {
+      if (drawList.roundedClips()) {
+        auto merged = std::make_shared<std::vector<RoundedClip>>(*drawList.roundedClips());
+        merged->insert(merged->end(), entry.roundedClips->begin(),
+                       entry.roundedClips->end());
+        drawList.setRoundedClips(std::move(merged));
+      } else {
+        drawList.setRoundedClips(entry.roundedClips);
+      }
+    }
     if (const auto* rounded = std::get_if<RoundedRectangleVisual>(&entry.element->visual)) {
       auto radii = rounded->radii.resolve(properties);
       radii.topLeft *= scale;
@@ -1290,6 +1468,41 @@ struct Runtime::Impl {
       }
       const auto resolvedPaint = paint(rounded->paint, entry, properties, input);
       const auto smoothing = rounded->smoothing.resolve(properties);
+      if (borderOnly) {
+        // Frame strokes have their own painter order. Clip contents clips
+        // CHILDREN, never the frame's centered/outside stroke itself.
+        drawList.roundedRect(entry.box.bounds, radii,
+                             Paint::solid(Color{}, 0.0f), smoothing, border);
+        return;
+      }
+      if (deferBorder) border = {};
+      if (!rounded->fillLayers.empty()) {
+        std::vector<Paint> layers;
+        layers.reserve(rounded->fillLayers.size());
+        bool simpleStack = true;
+        for (const auto& layer : rounded->fillLayers) {
+          auto layerPaint = paint(layer, entry, properties, input);
+          simpleStack = simpleStack &&
+            (layerPaint.kind==GradientKind::Solid ||
+             layerPaint.kind==GradientKind::Linear);
+          layers.emplace_back(std::move(layerPaint));
+        }
+        if (simpleStack && border.paint.kind==GradientKind::Solid) {
+          // One fragment evaluates all Figma paints and one common AA mask.
+          // Repeating AA in each layer produces subpixel halos at every edge.
+          drawList.roundedRectLayers(entry.box.bounds,radii,std::move(layers),
+                                      smoothing,std::move(border));
+        } else {
+          // Preserve exotic paint types without flattening their gradients.
+          for (const auto& layer : layers)
+            drawList.roundedRect(entry.box.bounds,radii,layer,smoothing);
+          if(border.width>0.0f ||
+             (border.individualWidths && border.individualWidths->maximum()>0.0f))
+            drawList.roundedRect(entry.box.bounds,radii,
+                                 Paint::solid(Color{},0.0f),smoothing,border);
+        }
+        return;
+      }
       Rect imageBounds = entry.box.bounds;
       bool fittedImage = false;
       if (rounded->image.enabled && rounded->image.sourceWidth > 0.0f &&
@@ -1369,13 +1582,64 @@ struct Runtime::Impl {
       const PropertyStore& properties, const FrameInput& input, DrawList& drawList,
       InstanceEmitter&& instanceEmitter) const {
     const Rect previousClip = drawList.clip();
+    const auto previousRoundedClips = drawList.roundedClips();
     const bool previousOverlay = drawList.overlayMode();
+    // A clipped Figma Frame's own center/inside stroke is visually above
+    // its children. Defer only its BORDER until the end of its subtree.
+    // Depth matches the layout's DFS order, with O(1) stack work per node.
+    std::vector<const Resolved*> deferredStrokes;
+    const auto drawTransformed = [&](const Resolved& entry,
+                                    bool borderOnly, bool deferBorder) {
+      if (!entry.transformed) {
+        draw(entry, properties, input, drawList, previousClip, borderOnly, deferBorder);
+        return;
+      }
+      DrawList temp;
+      Resolved unbounded = entry;
+      constexpr Rect largeLocalClip{-1000000.0f, -1000000.0f, 2000000.0f, 2000000.0f};
+      unbounded.box.clip = largeLocalClip;
+      draw(unbounded, properties, input, temp, largeLocalClip, borderOnly, deferBorder);
+      if (temp.commands().empty() && temp.overlayCommands().empty()) return;
+      drawList.setClip(previousClip);
+      drawList.projected(temp, entry.worldTransform);
+    };
+    const auto flushStrokes = [&](std::size_t nextDepth) {
+      while (!deferredStrokes.empty() &&
+             deferredStrokes.back()->depth >= nextDepth) {
+        drawList.setRoundedClips(previousRoundedClips);
+        drawTransformed(*deferredStrokes.back(), true, false);
+        deferredStrokes.pop_back();
+      }
+    };
     const auto emitEntry = [&](const Resolved& entry) {
+      flushStrokes(entry.depth);
+      drawList.setRoundedClips(previousRoundedClips);
       if (const auto* nested = std::get_if<InstanceVisual>(&entry.element->visual)) {
         drawList.setClip(intersect(entry.box.clip, previousClip));
+        if (entry.roundedClips) {
+          auto merged = std::make_shared<std::vector<RoundedClip>>();
+          if (previousRoundedClips) *merged = *previousRoundedClips;
+          merged->insert(merged->end(), entry.roundedClips->begin(),
+                         entry.roundedClips->end());
+          drawList.setRoundedClips(std::move(merged));
+        }
         instanceEmitter(entry, *nested);
       } else {
-        draw(entry, properties, input, drawList, previousClip);
+        const auto* frameVisual =
+          std::get_if<RoundedRectangleVisual>(&entry.element->visual);
+        bool hasFrameStroke = false;
+        if (frameVisual) {
+          hasFrameStroke = frameVisual->stroke.width.resolve(properties) > 0.0001f;
+          if (frameVisual->stroke.individualWidths) {
+            hasFrameStroke = hasFrameStroke ||
+              frameVisual->stroke.individualWidths->resolve(properties).maximum() > 0.0001f;
+          }
+        }
+        const bool deferFrameBorder =
+          entry.element->clipsChildren && !entry.element->children.empty() &&
+          frameVisual != nullptr && hasFrameStroke;
+        drawTransformed(entry, false, deferFrameBorder);
+        if (deferFrameBorder) deferredStrokes.push_back(&entry);
       }
     };
 
@@ -1385,13 +1649,16 @@ struct Runtime::Impl {
       for (const auto& entry : resolved) {
         if (!entry.box.overlay) emitEntry(entry);
       }
+      flushStrokes(0);
       drawList.beginOverlay();
       for (const auto& entry : resolved) {
         if (entry.box.overlay) emitEntry(entry);
       }
       drawList.endOverlay();
     }
+    flushStrokes(0);
     drawList.setClip(previousClip);
+    drawList.setRoundedClips(previousRoundedClips);
     if (previousOverlay) drawList.beginOverlay();
   }
 

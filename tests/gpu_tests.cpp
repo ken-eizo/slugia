@@ -67,6 +67,11 @@ int main(int argc, char **argv) try {
   const auto unitShape = atlas.addPath(unit);
   atlas.build();
   Window window({128, 128, "slugia GPU regression tests", false, false});
+  // Explicit redraw requests from a worker do not produce GLFW callbacks.
+  // They must still wake event-driven idle without waiting for a timer.
+  window.postRedrawEvent();
+  require(window.waitEventsTimeout(0.02),
+          "explicit redraw event must not be lost during UI idle");
   const bool performance = argc > 1 && (std::string_view(argv[1]) == "--research-profile" ||
                                        std::string_view(argv[1]) == "--research-profile-low-spec");
   auto config = performance ? RendererConfig::vectorPerformance(std::string_view(argv[1]) == "--research-profile-low-spec")
@@ -152,6 +157,286 @@ int main(int argc, char **argv) try {
                  "external image opacity must be applied exactly once");
       renderer.waitIdle();
       interop.unregisterExternalImage(image);
+    }
+    // Figma clipped Frame: its center stroke draws over child content, with
+    // the inner AND outer halves intact (rather than being obscured by child).
+    {
+      namespace sui = slugui;
+      auto frame = sui::roundedRectangle(
+        hashId("gpu-centered-stroke-frame"),
+        Paint::solid(Color::fromRgb8(0x000000)), CornerRadii::all(12.0f));
+      frame.clipsChildren = true;
+      frame.layout.width = sui::Length::physical(96);
+      frame.layout.height = sui::Length::physical(96);
+      auto& visual = std::get<sui::RoundedRectangleVisual>(frame.visual);
+      visual.stroke.width = 8.0f;
+      visual.stroke.align = StrokeAlign::Center;
+      visual.stroke.paint.normal = Paint::solid(Color::fromRgb8(0x007aff));
+      auto child = sui::roundedRectangle(
+        hashId("gpu-fully-overlapping-child"),
+        Paint::solid(Color::fromRgb8(0xff0000)));
+      child.layout.width = sui::Length::physical(96);
+      child.layout.height = sui::Length::physical(96);
+      frame.add(std::move(child));
+      auto root = sui::absolute(hashId("gpu-stroke-root"));
+      frame.layout.x = sui::Length::physical(16);
+      frame.layout.y = sui::Length::physical(16);
+      root.add(std::move(frame));
+      sui::Component component(std::move(root));
+      sui::Runtime runtime;
+      DrawList commands;
+      runtime.render(component, sui::FrameInput{}, commands, {0, 0, 128, 128});
+      auto pixels = renderer.drawAndReadback(commands);
+      auto sample = [&](int x, int y, int channel) {
+        return int(pixels.rgba[4U * (std::size_t(y) * pixels.width +
+                                        std::size_t(x)) + std::size_t(channel)]);
+      };
+      require(sample(18, 64, 2) > 200 && sample(18, 64, 0) < 40,
+              "Clip contents must not obscure the INSIDE half of a center frame stroke");
+      require(sample(14, 64, 2) > 200,
+              "Clip contents must not erase the OUTSIDE half of a center frame stroke");
+      require(sample(26, 64, 0) > 200 && sample(26, 64, 2) < 40,
+              "Frame stroke must not cover pixels beyond its actual width");
+    }
+
+    // Figma nested transforms: a rotated Frame and rotated child compose in
+    // world space. Rectangular geometry remains a sharp native vector shape.
+    {
+      namespace sui = slugui;
+      auto root = sui::absolute(hashId("nested-rotation-root"));
+      auto frame = sui::absolute(hashId("nested-rotation-frame"));
+      frame.layout.x = sui::Length::physical(60);
+      frame.layout.y = sui::Length::physical(20);
+      frame.layout.width = sui::Length::physical(50);
+      frame.layout.height = sui::Length::physical(70);
+      frame.localTransform = {0, 1, -1, 0};
+      auto child = sui::roundedRectangle(hashId("nested-rotation-child"),
+          Paint::solid(Color::fromRgb8(0xff0000)));
+      child.layout.x = sui::Length::physical(10);
+      child.layout.y = sui::Length::physical(5);
+      child.layout.width = sui::Length::physical(18);
+      child.layout.height = sui::Length::physical(12);
+      child.localTransform = {0, 1, -1, 0};
+      frame.add(std::move(child));
+      root.add(std::move(frame));
+      sui::Component scene(std::move(root));
+      sui::Runtime ui;
+      DrawList draws;
+      ui.render(scene, sui::FrameInput{}, draws, {0, 0, 128, 128});
+      const auto pixels = renderer.drawAndReadback(draws);
+      const auto r = [&](int x, int y) {
+        return int(pixels.rgba[4U * (std::size_t(y) * pixels.width +
+                                    std::size_t(x))]);
+      };
+      require(r(45, 24) > 220,
+              "nested 90+90 rotation must draw in correct world position");
+      require(r(80, 28) < 100,
+              "nested rotation must NOT paint in the original unrotated bounds");
+    }
+
+    // Projected multi-stop paints must rebase their packed stop-table offsets.
+    // Mix a normal gradient with a projected gradient in the same frame, so
+    // the parent frame must not lose pending gradient handles during recursion.
+    {
+      DrawList ramp;
+      const auto rampPaint = Paint::linearStops({
+        {0.0f, Color::fromRgb8(0xff0000)},
+        {0.5f, Color::fromRgb8(0x00ff00)},
+        {1.0f, Color::fromRgb8(0xff0000)}
+      }, {0,0}, {1,0});
+      ramp.roundedRect({16, 16, 60, 30}, 0, rampPaint);
+      DrawList outer;
+      outer.roundedRect({5, 5, 12, 12}, 0, rampPaint);
+      ProjectiveTransform2D rotation;
+      rotation.matrix = {0,-1,120, 1,0,0, 0,0,1};
+      outer.projected(ramp, rotation);
+      outer.roundedRect({104, 104, 12, 12}, 0, rampPaint);
+      const auto pixels = renderer.drawAndReadback(outer);
+      const auto channel = [&](int x, int y, int c) {
+        return int(pixels.rgba[4U * (std::size_t(y) * pixels.width +
+                                    std::size_t(x)) + std::size_t(c)]);
+      };
+      require(channel(90, 21, 0) > channel(90, 21, 1) + 70,
+              "rotated multi-stop ramp must start red");
+      require(channel(90, 45, 1) > channel(90, 45, 0) + 70,
+              "rotated multi-stop ramp must preserve green middle stop");
+      require(channel(90, 71, 0) > channel(90, 71, 1) + 70,
+              "rotated multi-stop ramp must return to red");
+      require(channel(11, 11, 1) > 120 && channel(110, 110, 1) > 120,
+              "the surrounding nonprojected paints must retain their stop tables");
+    }
+
+    // Figma angle/radius/diamond gradients carry the full stop table and
+    // affine instead of flattening the first and last colors. Red at both
+    // angular endpoints MUST NOT become a solid red fill.
+    {
+      const auto red = Color::fromRgb8(0xff0000);
+      const auto green = Color::fromRgb8(0x00ff00);
+      const auto blue = Color::fromRgb8(0x0000ff);
+      const auto yellow = Color::fromRgb8(0xffff00);
+      const std::array<float,6> identity{1,0,0, 0,1,0};
+      const auto angular = Paint::figmaStops(GradientKind::AngularStops,
+        {{0.0f,red},{0.25f,green},{0.5f,blue},{0.75f,yellow},{1.0f,red}},
+        identity);
+      const auto radial = Paint::figmaStops(GradientKind::RadialStops,
+        {{0.0f,red},{1.0f,blue}}, identity);
+      const auto diamond = Paint::figmaStops(GradientKind::DiamondStops,
+        {{0.0f,red},{1.0f,blue}}, identity);
+      auto sample = [&](const Paint& paint, int x, int y, int channel) {
+        DrawList scene;
+        scene.roundedRect({20,20,88,88},0,paint);
+        const auto pixels = renderer.drawAndReadback(scene);
+        return int(pixels.rgba[4U*(std::size_t(y)*pixels.width+
+                                 std::size_t(x))+std::size_t(channel)]);
+      };
+      require(sample(angular,64,24,0) > 180,
+              "angular 0 stop starts red at the top");
+      require(sample(angular,102,64,1) > sample(angular,102,64,0) + 120,
+              "angular 0.25 stop must be green at the right");
+      require(sample(angular,64,102,2) > sample(angular,64,102,0) + 120,
+              "angular 0.5 stop must be blue at the bottom");
+      require(sample(angular,26,64,0) > 160 && sample(angular,26,64,1) > 160,
+              "angular 0.75 stop must be yellow at the left");
+      require(sample(radial,64,64,0) > 180 &&
+              sample(radial,64,24,2) > 160,
+              "radial stop table must interpolate center to edge");
+      require(sample(diamond,64,64,0) > 180 &&
+              sample(diamond,104,64,2) > 160,
+              "diamond stop table must interpolate center to edge");
+    }
+
+    // Parent Clip contents remains in the PARENT coordinate frame even if
+    // the child counter-rotates. A screen-space mask must remove the part
+    // outside the rotated parent without clipping the visible slice.
+    {
+      namespace sui = slugui;
+      auto root = sui::absolute(hashId("clip-rotation-root"));
+      auto frame = sui::absolute(hashId("clip-rotation-parent"));
+      frame.layout.x = sui::Length::physical(60);
+      frame.layout.y = sui::Length::physical(20);
+      frame.layout.width = sui::Length::physical(40);
+      frame.layout.height = sui::Length::physical(40);
+      frame.localTransform = {0, 1, -1, 0};
+      frame.clipsChildren = true;
+      auto child = sui::roundedRectangle(hashId("counterrotated-child"),
+          Paint::solid(Color::fromRgb8(0xff0000)));
+      child.layout.x = sui::Length::physical(5);
+      child.layout.y = sui::Length::physical(5);
+      child.layout.width = sui::Length::physical(60);
+      child.layout.height = sui::Length::physical(30);
+      child.localTransform = {0, -1, 1, 0};
+      child.interaction = {true, true, 19};
+      frame.add(std::move(child));
+      root.add(std::move(frame));
+      sui::Component scene(std::move(root));
+      sui::Runtime runtime;
+      DrawList draws;
+      runtime.render(scene, sui::FrameInput{}, draws, {0, 0, 128, 128});
+      const auto pixels = renderer.drawAndReadback(draws);
+      const auto red = [&](int x, int y) {
+        return int(pixels.rgba[4U * (std::size_t(y)*pixels.width +
+                                    std::size_t(x))]);
+      };
+      require(red(57,30) > 220,
+              "counterrotated child visible pixels must remain in rotated clip");
+      require(red(80,30) < 100,
+              "counterrotated child outside rotated Frame must be clipped");
+      require(runtime.hitTest({80,30}) == sui::RuntimeNodeId{},
+              "counterrotated clipped area must not be interactive");
+    }
+
+    // Three Figma paint layers combine into a 2D HSV-style saturation/value
+    // square: top-left white, top-right red, bottom nearly black. The GPU
+    // must blend each gradient over the same shape, in stack order.
+    {
+      const Rect area{16, 16, 96, 96};
+      DrawList layered;
+      layered.roundedRect(area, 0, Paint::solid(Color::fromRgb8(0xffffff)));
+      layered.roundedRect(area, 0, Paint::gradient(
+        GradientKind::Linear, Color::fromRgb8(0xffffff),
+        Color::fromRgb8(0xff0000), {0,0}, {1,0}));
+      layered.roundedRect(area, 0, Paint::gradient(
+        GradientKind::Linear, Color::fromRgb8(0x000000, 0),
+        Color::fromRgb8(0x000000), {0,0}, {0,1}));
+      const auto pixels = renderer.drawAndReadback(layered);
+      const auto sample = [&](int x, int y, int component) {
+        return int(pixels.rgba[4U * (std::size_t(y) * pixels.width +
+                                        std::size_t(x)) + std::size_t(component)]);
+      };
+      require(sample(20, 20, 0) > 180 && sample(20, 20, 1) > 180,
+              "HSV square upper-left must be near white");
+      require(sample(100, 20, 0) > 180 && sample(100, 20, 1) < 40,
+              "HSV square upper-right must be red");
+      require(sample(20, 108, 0) < 75 && sample(100, 108, 0) < 75,
+              "HSV square bottom must darken all horizontal positions");
+    }
+
+    // Native 3-stop hue ramp must preserve its middle color even when
+    // the first/last stops are both red. Verify direct and retained paths.
+    {
+      const auto paint = Paint::linearStops({
+        {0.0f, Color::fromRgb8(0xff0000)},
+        {0.5f, Color::fromRgb8(0x00ff00)},
+        {1.0f, Color::fromRgb8(0xff0000)}
+      }, {0.0f, 0.0f}, {0.0f, 1.0f});
+      DrawList ramp;
+      ramp.roundedRect({24, 12, 36, 104}, 0.0f, paint);
+      const auto pixels = renderer.drawAndReadback(ramp);
+      const auto sample = [&](int x, int y, int channel) {
+        return int(pixels.rgba[4U * (std::size_t(y) * pixels.width +
+                                        std::size_t(x)) + std::size_t(channel)]);
+      };
+      require(sample(42, 18, 0) > sample(42, 18, 1) + 50,
+              "multistop gradient must be red at the first stop");
+      require(sample(42, 64, 1) > sample(42, 64, 0) + 50,
+              "multistop gradient must keep its GREEN middle stop");
+      require(sample(42, 110, 0) > sample(42, 110, 1) + 50,
+              "multistop gradient must return to red at the last stop");
+      const auto retainedRamp = renderer.createRetainedDrawList(ramp);
+      DrawList display;
+      display.retainedDrawList(retainedRamp);
+      samePixels(pixels, renderer.drawAndReadback(display),
+                 "retained multistop gradient must keep its color table");
+      renderer.destroyRetainedDrawList(retainedRamp);
+    }
+    // Rounded ancestor clip must hide pixels in rounded corners, while
+    // preserving full coverage in its interior; nested clips are intersected.
+    {
+      auto masks = std::make_shared<std::vector<RoundedClip>>();
+      masks->push_back({{20, 20, 80, 80}, CornerRadii::all(20)});
+      DrawList masked;
+      masked.setRoundedClips(masks);
+      masked.roundedRect({20, 20, 80, 80}, 0,
+                         Paint::solid(Color::fromRgb8(0xffffff)));
+      const auto pixels = renderer.drawAndReadback(masked);
+      const auto channel = [&](int x, int y, int c) {
+        return int(pixels.rgba[4U * (std::size_t(y) * pixels.width +
+                                     std::size_t(x)) + std::size_t(c)]);
+      };
+      require(channel(21, 21, 0) < 15,
+              "rounded clip must remove the outside corner");
+      require(channel(50, 50, 0) > 245,
+              "rounded clip must preserve fully-inside pixels");
+      DrawList retainedMasked;
+      const auto id = renderer.createRetainedDrawList(masked);
+      retainedMasked.retainedDrawList(id);
+      samePixels(pixels, renderer.drawAndReadback(retainedMasked),
+                 "retained rounded clip must keep mask data");
+      renderer.destroyRetainedDrawList(id);
+      masks->push_back({{35, 35, 40, 40}, CornerRadii::all(16)});
+      DrawList nested;
+      nested.setRoundedClips(masks);
+      nested.roundedRect({20, 20, 80, 80}, 0,
+                         Paint::solid(Color::fromRgb8(0xffffff)));
+      const auto nestedPixels = renderer.drawAndReadback(nested);
+      const auto nestedChannel = [&](int x, int y) {
+        return int(nestedPixels.rgba[4U * (std::size_t(y) * nestedPixels.width +
+                                           std::size_t(x))]);
+      };
+      require(nestedChannel(36, 36) < 15,
+              "nested rounded corner must be clipped");
+      require(nestedChannel(55, 55) > 245,
+              "intersection of two rounded masks must keep interior");
     }
     cachedPixels = renderer.drawAndReadback(scene);
     const auto retained = renderer.createRetainedDrawList(scene);

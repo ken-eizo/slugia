@@ -7,6 +7,7 @@
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <utility>
 
@@ -96,24 +97,30 @@ Window::Window(const WindowConfig& config) {
   glfwSetWindowUserPointer(window_, this);
   updateFramebufferScale();
   glfwSetCursorPosCallback(window_, [](GLFWwindow* w, double x, double y) {
+    ++windowFrom(w)->eventRevision_;
     const Vec2 position = windowFrom(w)->cursorInFramebuffer(x, y);
     windowFrom(w)->input_.onCursor(position.x, position.y);
   });
   glfwSetMouseButtonCallback(window_, [](GLFWwindow* w, int button, int action, int) {
+    ++windowFrom(w)->eventRevision_;
     windowFrom(w)->input_.onMouseButton(button, action);
   });
   glfwSetKeyCallback(window_, [](GLFWwindow* w, int key, int, int action, int) {
+    ++windowFrom(w)->eventRevision_;
     const Key mapped = mapGlfwKey(key);
     if (mapped != Key::Unknown)
       windowFrom(w)->input_.onKey(static_cast<int>(mapped), action);
   });
   glfwSetScrollCallback(window_, [](GLFWwindow* w, double x, double y) {
+    ++windowFrom(w)->eventRevision_;
     windowFrom(w)->input_.onScroll(x, y, glfwGetTime());
   });
   glfwSetCharCallback(window_, [](GLFWwindow* w, unsigned int codepoint) {
+    ++windowFrom(w)->eventRevision_;
     windowFrom(w)->input_.onCodepoint(codepoint);
   });
   glfwSetDropCallback(window_, [](GLFWwindow* w, int count, const char** paths) {
+    ++windowFrom(w)->eventRevision_;
     auto* owner = windowFrom(w);
     if (!owner->dropCallback_) return;
     std::vector<std::string> copied;
@@ -128,17 +135,27 @@ Window::Window(const WindowConfig& config) {
     }
   });
   glfwSetWindowRefreshCallback(window_, [](GLFWwindow* w) {
+    ++windowFrom(w)->eventRevision_;
     windowFrom(w)->invokeRefreshCallback();
   });
   glfwSetFramebufferSizeCallback(window_, [](GLFWwindow* w, int width, int height) {
+    ++windowFrom(w)->eventRevision_;
     windowFrom(w)->updateFramebufferScale();
     if (width > 0 && height > 0) windowFrom(w)->invokeRefreshCallback();
   });
   glfwSetWindowSizeCallback(window_, [](GLFWwindow* w, int, int) {
+    ++windowFrom(w)->eventRevision_;
     windowFrom(w)->updateFramebufferScale();
   });
   glfwSetWindowContentScaleCallback(window_, [](GLFWwindow* w, float, float) {
+    ++windowFrom(w)->eventRevision_;
     windowFrom(w)->updateFramebufferScale();
+  });
+  glfwSetWindowFocusCallback(window_, [](GLFWwindow* w, int) {
+    ++windowFrom(w)->eventRevision_;
+  });
+  glfwSetWindowIconifyCallback(window_, [](GLFWwindow* w, int) {
+    ++windowFrom(w)->eventRevision_;
   });
 
   double x = 0.0;
@@ -192,6 +209,9 @@ Vec2 Window::cursorInFramebuffer(double x, double y) const {
 }
 
 void Window::pollEvents() {
+  // Consume requests BEFORE dispatch: a new worker request arriving during
+  // event dispatch must remain pending for the next idle iteration.
+  pendingRedraw_.exchange(false, std::memory_order_acq_rel);
   input_.beginFrame();
   glfwPollEvents();
   if (callbackException_) {
@@ -202,6 +222,32 @@ void Window::pollEvents() {
   // declarative frame on an older coalesced callback position.
   resampleCursor();
   input_.finishFrame(glfwGetTime());
+}
+
+bool Window::waitEventsTimeout(double timeoutSeconds) {
+  if (!std::isfinite(timeoutSeconds) || timeoutSeconds < 0.0)
+    throw std::invalid_argument("Event wait requires a finite nonnegative timeout");
+  if (pendingRedraw_.exchange(false, std::memory_order_acq_rel)) {
+    pollEvents();
+    return true;
+  }
+  const auto before=eventRevision_;
+  input_.beginFrame();
+  glfwWaitEventsTimeout(timeoutSeconds);
+  if (callbackException_) {
+    auto error = std::exchange(callbackException_, {});
+    std::rethrow_exception(error);
+  }
+  resampleCursor();
+  input_.finishFrame(glfwGetTime());
+  const bool explicitRedraw =
+    pendingRedraw_.exchange(false, std::memory_order_acq_rel);
+  return eventRevision_ != before || explicitRedraw;
+}
+
+void Window::postRedrawEvent() noexcept {
+  pendingRedraw_.store(true, std::memory_order_release);
+  glfwPostEmptyEvent();
 }
 
 void Window::resampleCursor() {

@@ -3,6 +3,7 @@
 #include "slugia/draw_list.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -23,6 +24,11 @@ struct RendererConfig {
   // support compositor alpha; otherwise construction fails rather than silently
   // presenting an opaque overlay.
   bool transparentSurface = false;
+  // Figma's legacy sRGB paint compositing is performed on encoded sRGB
+  // channel values. Prefer an SRGB_NONLINEAR UNORM swapchain to keep source-
+  // over blending in sRGB; SRGB images would linearize in the blend unit.
+  // Off by default: preserve existing linear-light behavior for non-Figma apps.
+  bool preferSrgbAlphaCompositing = false;
   Color clearColor = Color::fromRgb8(0x0b1020);
   bool validation = false;
   // false prefers refresh-synchronized MAILBOX for smooth low-latency interaction.
@@ -96,6 +102,30 @@ struct RendererConfig {
     result.enableCompactPersistentCurves = true;
     result.enablePackedAtlasBands = true;
     result.atlasBandRefinementCells = 1024;
+    return result;
+  }
+
+  // Interactive application preset: share the lossless vector compaction
+  // features of vectorPerformance(), but allocate far smaller bounded
+  // caches/buffers. Preserves continuous corner precision; callers that
+  // animate huge canvases can choose vectorPerformance() explicitly.
+  // These are allocator BUDGETS, not a total GPU VRAM usage guarantee.
+  [[nodiscard]] static RendererConfig interactiveUi(bool lowMemory = false) noexcept {
+    auto result = vectorPerformance(lowMemory);
+    result.vsync = true;
+    result.allowTearing = false;
+    result.initialVertexCapacity = std::min<std::size_t>(
+      result.initialVertexCapacity, 1U << 10U);
+    result.retainedArenaInitialBytes = std::min<std::size_t>(
+      result.retainedArenaInitialBytes, 128U << 10U);
+    result.glyphRunCacheCapacity = std::min<std::size_t>(
+      result.glyphRunCacheCapacity, 256U);
+    result.dynamicPathCacheBytes = std::min<std::size_t>(
+      result.dynamicPathCacheBytes, 2U << 20U);
+    result.dynamicGeometryCacheBytes = std::min<std::size_t>(
+      result.dynamicGeometryCacheBytes, 1U << 20U);
+    result.persistentGeometryBufferBytes = std::min<std::size_t>(
+      result.persistentGeometryBufferBytes, 2U << 20U);
     return result;
   }
 };

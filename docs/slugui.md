@@ -243,13 +243,20 @@ property型は`bool`、`int`、`float`、`string`、`color`、`paint`、`length`
 length suffixは`px`（論理px）、`ppx`（framebuffer物理px）、`%`、`auto`です。
 `position: absolute`はRow/Column内のchildだけをflowから外す軽量なitem指定で、通常の
 `Absolute` containerとは別です。min/max width/height、grow、align-selfとも併用できます。
-paintはcolor literal、`solid`、`linear`、`diamond`、`radial`、`shader`を扱います。
+`transform: [a,b,c,d]`は、ローカル座標の2×2 affine基底です。並進は従来の`x/y`で記述します。親子のtransformはRuntimeが順に乗算し、回転したFrame内の子は親ローカル座標で配置されます。例えば90°回転は`transform: [0, 1, -1, 0]`です。特異行列はコンパイルエラーにします。非回転は従来の高速経路を使用し、回転したノードだけVulkanのprojected描画を使用します。
+paintはcolor literal、`solid`、`linear`、`linear-stops`、`diamond`、`radial`、`shader`を扱います。
+多段線形グラデーションは`linear-stops([stop(position, #color), ...], ox, oy, tx, ty)`で2–256ストップを保持し、
+`Paint::linearStops`が共有immutable stop tableを確保してGPUに配置します。FigmaのAngular・Radial・Diamondは`angular-stops`/`radial-stops`/`diamond-stops`で**全ストップとnode正規化座標→gradient空間の2×3 affine行列**を保持し、GPUのstop tableから評価します。例：`angular-stops([stop(0, #ff0000), stop(0.5, #00ff00), stop(1, #ff0000)], 1, 0, 0, 0, 1, 0)`。通常の単色/2色linear gradientは従来の高速経路を維持します。
+例：`fill: linear-stops([stop(0, #ff0000), stop(0.5, #00ff00), stop(1, #ff0000)], 0, 0, 0, 1);`。
+Frame / Rectangleの複数fillは`fill-layers: [#ffffff, linear(#ffffff, #ff0000, 0, 0, 1, 0), linear(#00000000, #000000, 0, 0, 0, 1)];`のように、背面→前面の順で指定します。通常のアルファ合成をGPUで行い、非Normal blend modeは現時点では未再現です。
 Rectangleの`stroke`にも同じPaintを使用でき、`stroke-width`は論理px、
 `stroke-align`は`inside` / `center` / `outside`です。stroke ringは解析シェーダーで
 評価され、同一batch内の追加quadになります。`stroke-width: [top, right, bottom, left]`で
 4辺を独立指定でき、各辺のInside/Center/Outside量と内外の角丸も個別幅から計算します。
 paddingは1値、CSS順の2値`[vertical, horizontal]`、または
 `[left, top, right, bottom]`です。radius/smoothingは1値または4角を指定できます。
+`clip: true`はFrameの子を矩形または角丸境界で切り抜き、描画用の角丸祖先マスクをGPUへ共有表として送ります。
+複数の角丸祖先はそれぞれの親ローカル座標で積集合を判定します。回転した親FrameのClipも親の座標を維持し、子の回転には追従しません。クリック判定も同じ逆affineを使います。ClipされたFrame自身のcenter/inside/outsideストロークは子要素より後に描き、Frame自身の境界では切り取られません。Figma独自corner smoothingはsuperellipse近似なのでピクセル完全一致は保証しません。
 `text-runs`は静的rangeの文字列と`TextStyle`をAOTで型付き配列へ変換します。引数は
 `text, font, size, weight, italic, underline, strikethrough, letter-spacing, line-height, paint`
 の順で、各runの文字を連結した結果は`text`と完全一致しなければbuild errorです。
@@ -259,7 +266,7 @@ loweringします。
 ## この版の対応範囲
 
 - runtime hot reloadは非対応。compilerはbuild-time AOTのみ
-- Figma exporterはRectangleのstroke paint/width/alignと、SVG由来vectorの
+- Figma exporterはRectangleのstroke paint/width/align、3–256色のlinear-stop gradientと、SVG由来vectorの
   fill/stroke geometry・paintを実装済み。inside/outsideはFigmaのoutline結果を焼き込む。
   EVENODD windingも保持する。exporterのfidelity分類ではApproximatedを付ける場合がある
 - textはrange別family、size、numeric weight、italic、underline/strikethrough、色、
@@ -271,7 +278,8 @@ loweringします。
   component/instance/variantのsource provenanceと依存変更refreshは実装済み。
   BOOLEAN/TEXT component-property referenceはtyped propertyへlowering済みだが、
   Figma Instanceをmain-definition参照として直接出力するdedup、INSTANCE_SWAP、SLOT差し替え、
-  VARIANT変更によるdefinition/tree selection、variables/token modeは未実装
+  VARIANT変更によるdefinition/tree selectionとdynamic token evaluationは未実装。
+  色/線/透明度のVariablesはエクスポート時にFigmaのconsumer適用modeを使って静的値へ解決する
 - C++のnested instance合成は`SceneRuntime`で対応する。AOT CLIの`definition` / `Instance`宣言は
   完結した生成経路を持たないため本版の対応外。共有definitionは生成structの
   `makeSharedDefinition`またはC++ builderで作成する

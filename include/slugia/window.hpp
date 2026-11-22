@@ -4,6 +4,8 @@
 
 #include <exception>
 #include <functional>
+#include <cstdint>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -38,6 +40,14 @@ public:
   // the callback vector, so copy any path that must outlive the callback.
   void setDropCallback(std::function<void(const std::vector<std::string>&)> callback);
   void pollEvents();
+  // Suspend this thread until a native input/window event or a timeout.
+  // Returns false if no callbacks were delivered: a static UI can skip
+  // rebuilding command lists and submitting a duplicate frame entirely.
+  // Timeout is in seconds, non-negative. Do not use during live animation.
+  [[nodiscard]] bool waitEventsTimeout(double timeoutSeconds);
+  // Posts an explicit redraw request from any thread. The next event wait
+  // must report a change even though GLFW has no callback for empty events.
+  void postRedrawEvent() noexcept;
   // Refreshes only the absolute pointer position. Call immediately before building latency-critical
   // drag UI when useful; button/key edges still come from pollEvents().
   void resampleCursor();
@@ -58,6 +68,8 @@ private:
   bool ownsGlfwReference_ = false;
   Vec2 framebufferScale_ = {1.0f, 1.0f};
   InputState input_{};
+  std::uint64_t eventRevision_ = 0;
+  std::atomic<bool> pendingRedraw_{false};
   std::function<void()> refreshCallback_{};
   std::function<void(const std::vector<std::string>&)> dropCallback_{};
   std::exception_ptr callbackException_{};
